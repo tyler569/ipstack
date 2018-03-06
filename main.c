@@ -243,7 +243,7 @@ size_t make_ip_arp_req(void *buf, char *my_ip, char *req_ip) {
     arp->target_mac = zero_mac;
     arp->target_ip = htonl(ip_from_str(req_ip));
 
-    return loc + sizeof(struct arp_pkt);
+    return loc + sizeof(*arp);
 }
 
 size_t make_ip_arp_resp(void *buf, struct arp_pkt *req) {
@@ -262,7 +262,7 @@ size_t make_ip_arp_resp(void *buf, struct arp_pkt *req) {
     arp->target_mac = req->sender_mac;
     arp->target_ip = req->sender_ip;
 
-    return loc + sizeof(struct arp_pkt);
+    return loc + sizeof(*arp);
 }
 
 
@@ -317,7 +317,7 @@ size_t make_ip_hdr(void *buf, uint16_t id, uint8_t proto, uint32_t dst_ip) {
     ip->src_ip = htonl(my_ip);
     ip->dst_ip = htonl(dst_ip);
 
-    return sizeof(struct ip_hdr);
+    return sizeof(*ip);
 };
 
 void place_icmp_checksum(struct icmp_pkt *icmp, size_t extra_len) {
@@ -344,10 +344,20 @@ size_t make_icmp_resp(void *buf, struct icmp_pkt *req, size_t len) {
 
     memcpy(&icmp->data, &req->data, len);
     
-    return sizeof(struct icmp_pkt) + len;
+    return sizeof(*icmp) + len;
 }
 
-size_t icmp_respond() {
+size_t make_udp_resp(void *buf, struct udp_pkt *req, size_t len) {
+    struct udp_pkt *udp = buf;
+
+    udp->src_port = req->dst_port;
+    udp->dst_port = req->src_port;
+    udp->len = req->len;
+    udp->checksum = 0; // checksum disabled;
+
+    memcpy(&udp->data, &req->data, len);
+
+    return sizeof(*udp) + len;
 }
 
 void write_to_wire(int fd, void *buf, size_t len) {
@@ -401,9 +411,28 @@ void process_icmp(int fd, void *buf) {
     size_t icmp_data_len = ntohs(ip->total_len) - sizeof(*hdr) - sizeof(*pkt);
     printf("total icmp data length: %i\n", icmp_data_len);
     index += make_icmp_resp(pkt, icmp, icmp_data_len);
+
     hdr->total_len = htons(index - sizeof(struct eth_hdr));
     place_ip_checksum(hdr);
     place_icmp_checksum(pkt, icmp_data_len);
+    write_to_wire(fd, sendbuf, index);
+    free(sendbuf);
+}
+
+void process_udp_echo(int fd, void *buf) {
+    struct eth_hdr *eth = buf;
+    struct ip_hdr *ip = buf + sizeof(*eth);
+    struct udp_pkt *udp = (void *)ip + sizeof(*ip);
+
+    void *sendbuf = malloc(ETH_MTU);
+    size_t index = make_eth_hdr(sendbuf, eth->src_mac, my_mac, ETH_IP);
+    struct ip_hdr *sendip = sendbuf + index;
+    index += make_ip_hdr(sendip, ntohs(ip->id), PROTO_UDP, ntohl(ip->src_ip));
+    struct udp_pkt *sendudp = sendbuf + index;
+    index += make_udp_resp(sendudp, udp, ntohs(ip->total_len) - sizeof(*sendip) - sizeof(*sendudp));
+
+    sendip->total_len = htons(index - sizeof(struct eth_hdr));
+    place_ip_checksum(sendip);
     write_to_wire(fd, sendbuf, index);
     free(sendbuf);
 }
@@ -412,7 +441,7 @@ void process_ip_packet(int fd, void *buf) {
     struct eth_hdr *eth = buf;
     struct ip_hdr *ip = buf + sizeof(*eth);
 
-    printf("IP detected, next type %x\n", ip->proto);
+    printf("IP detected, next type %#02hhx\n", ip->proto);
     if (ip->dst_ip != htonl(my_ip)) {
         printf("Not for my IP, ignoring\n");
         return;
@@ -423,7 +452,7 @@ void process_ip_packet(int fd, void *buf) {
         process_icmp(fd, buf);
         break;
     case PROTO_UDP:
-        //process_udp(fd, buf);
+        process_udp_echo(fd, buf);
         break;
     default:
         printf("Unknown IP protocol %i\n", ip->proto);
@@ -435,8 +464,9 @@ void process_ethernet(int fd, void *buf) {
     struct eth_hdr *eth = buf;
 
     uint32_t dest_mac_hash = hash_mac(eth->dst_mac);
-    if (dest_mac_hash != my_mac_hash || dest_mac_hash != bcast_mac_hash) {
+    if (dest_mac_hash != my_mac_hash && dest_mac_hash != bcast_mac_hash) {
         printf("Not for my MAC addr, ignoring\n");
+        return;
     }
 
     switch (eth->ethertype) {
@@ -447,7 +477,7 @@ void process_ethernet(int fd, void *buf) {
         process_ip_packet(fd, buf);
         break;
     default:
-        printf("Unknown ethertype %06#lx\n");
+        printf("Unknown ethertype %#06hx\n", htons(eth->ethertype));
         break;
     }
 }
@@ -482,38 +512,24 @@ int main() {
     free(req);
 
     char buf[4096];
-    struct eth_hdr *eth = (void *)buf;
     while (true) {
+        errno = 0;
         int count = read(fd, buf, 4096);
 
-        if (count > 0) {
-            uint32_t from = hash_mac(eth->dst_mac);
-            if (from != my_mac_hash && from != bcast_mac_hash) {
-                printf("Not for me - skipping\n");
-                continue;
-            }
-            printf("Read this from the socket:\n");
-            for (int i=0; i<count; i++) {
-                printf("%02hhx ", buf[i]);
-            }
-            printf("\n");
-
-            process_ethernet(fd, buf);
-
-            /*
-            printf("Ethertype: %#06x\n", ntohs(eth->ethertype));
-
-
-
-            } else if (eth->type == htons(ETH_IP)) {
-                struct ip_hdr *ip = (void *)&eth->data;
-            }
-
-            printf("\n");
-            */
-        } else {
-            printf("Read nothing - bad something\n");
+        if (count <= 0) {
+            printf("Error reading interface (%s)\n", strerror(errno));
+            exit(0);
         }
+
+        printf("\n");
+        printf("Read this from the socket:\n");
+        for (int i=0; i<count; i++) {
+            printf("%02hhx ", buf[i]);
+        }
+        printf("\n");
+
+        process_ethernet(fd, buf);
+
         memset(buf, 0, count);
     }
 }
