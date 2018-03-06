@@ -19,19 +19,20 @@
 // const char *tun_name = "tap0"
 
 #ifdef __GNUC__
-# define __packed __attribute__((packed))
+# define _packed __attribute__((packed))
 #else
 # error "Need to support non-GNUC first to ensure struct packing"
 #endif
 
+#define const_htons(x) (((x & 0xFF00) >> 8) | ((x & 0x00FF) << 8))
+
 #define ETH_MTU 1536
 
-
-struct __packed mac_addr {
+struct _packed mac_addr {
     char data[6];
 };
 
-uint32_t hash_mac_addr(struct mac_addr mac) {
+uint32_t hash_mac(struct mac_addr mac) {
     uint32_t hash = 0;
     hash += mac.data[5];
     hash += mac.data[4] << 8;
@@ -43,14 +44,19 @@ uint32_t hash_mac_addr(struct mac_addr mac) {
     return hash;
 }
 
-struct __packed eth_hdr {
+enum ethertype {
+    ETH_IP = 0x0800,
+    ETH_ARP = 0x0806,
+};
+
+struct _packed eth_hdr {
     struct mac_addr dst_mac;
     struct mac_addr src_mac;
-    uint16_t type;
+    uint16_t ethertype;
     uint8_t data[0];
 };
 
-struct __packed arp_pkt {
+struct _packed arp_pkt {
     // eth_hdr
     uint16_t hw_type;
     uint16_t proto;
@@ -63,7 +69,13 @@ struct __packed arp_pkt {
     uint32_t target_ip;
 };
 
-struct __packed ip_hdr {
+enum ip_protocol_numbers {
+    PROTO_ICMP = 1,
+    PROTO_TCP = 6,
+    PROTO_UDP = 17,
+};
+
+struct _packed ip_hdr {
     // eth_hdr
     uint8_t hdr_len : 4;
     uint8_t version : 4;
@@ -73,7 +85,7 @@ struct __packed ip_hdr {
     uint16_t flags_frag;
     uint8_t ttl;
     uint8_t proto;
-    uint16_t hdr_chksm;
+    uint16_t hdr_checksum;
     uint32_t src_ip;
     uint32_t dst_ip;
     uint8_t data[0];
@@ -84,15 +96,24 @@ enum icmp_type {
     ICMP_ECHO_RESP = 0,
 };
 
-struct __packed icmp_pkt {
+struct _packed icmp_pkt {
     // ip_hdr
     uint8_t type;
     uint8_t code;
-    uint16_t chksm;
+    uint16_t checksum;
     uint16_t ident;
     uint16_t sequence;
     uint32_t timestamp;
     uint32_t timestamp_low;
+    uint8_t data[0];
+};
+
+struct _packed udp_pkt {
+    // ip_hdr
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t len;
+    uint16_t checksum;
     uint8_t data[0];
 };
 
@@ -198,7 +219,7 @@ void print_ip_addr(uint32_t ip) {
 size_t make_eth_hdr(struct eth_hdr *pkt, struct mac_addr dst, struct mac_addr src, uint16_t type) {
     pkt->dst_mac = dst;
     pkt->src_mac = src;
-    pkt->type = htons(type);
+    pkt->ethertype = htons(type);
     return sizeof(struct eth_hdr);
 }
 
@@ -264,7 +285,7 @@ void print_arp_pkt(struct arp_pkt *arp) {
     }
 }
 
-void place_ip_chksm(struct ip_hdr *ip) {
+void place_ip_checksum(struct ip_hdr *ip) {
     uint16_t *ip_chunks = (uint16_t *)ip;
     uint32_t checksum32 = 0;
     for (int i=0; i<ip->hdr_len*2; i+=1) {
@@ -272,7 +293,7 @@ void place_ip_chksm(struct ip_hdr *ip) {
     }
     uint16_t checksum = (checksum32 & 0xFFFF) + (checksum32 >> 16);
 
-    ip->hdr_chksm = ~checksum;
+    ip->hdr_checksum = ~checksum;
 }
 
 size_t make_ip_hdr(void *buf, uint16_t id, uint8_t proto, uint32_t dst_ip) {
@@ -292,14 +313,14 @@ size_t make_ip_hdr(void *buf, uint16_t id, uint8_t proto, uint32_t dst_ip) {
     ip->flags_frag = htons(0x4000); // dnf
     ip->ttl = 255;
     ip->proto = proto;
-    ip->hdr_chksm = 0; // get later!
+    ip->hdr_checksum = 0; // get later!
     ip->src_ip = htonl(my_ip);
     ip->dst_ip = htonl(dst_ip);
 
     return sizeof(struct ip_hdr);
 };
 
-void place_icmp_chksm(struct icmp_pkt *icmp, size_t extra_len) {
+void place_icmp_checksum(struct icmp_pkt *icmp, size_t extra_len) {
     uint16_t *icmp_chunks = (uint16_t *)icmp;
     uint32_t checksum32 = 0;
     for (int i=0; i<(sizeof(struct icmp_pkt) + extra_len)/2; i+=1) {
@@ -307,7 +328,7 @@ void place_icmp_chksm(struct icmp_pkt *icmp, size_t extra_len) {
     }
     uint16_t checksum = (checksum32 & 0xFFFF) + (checksum32 >> 16);
 
-    icmp->chksm = ~checksum;
+    icmp->checksum = ~checksum;
 }
 
 size_t make_icmp_resp(void *buf, struct icmp_pkt *req, size_t len) {
@@ -315,7 +336,7 @@ size_t make_icmp_resp(void *buf, struct icmp_pkt *req, size_t len) {
     
     icmp->type = ICMP_ECHO_RESP;
     icmp->code = 0;
-    icmp->chksm = 0; // get later!
+    icmp->checksum = 0; // get later!
     icmp->ident = req->ident; // stays in network byte-order
     icmp->sequence = req->sequence; // stays in network byte-order
     icmp->timestamp = req->timestamp; // stays in network byte-order
@@ -324,6 +345,9 @@ size_t make_icmp_resp(void *buf, struct icmp_pkt *req, size_t len) {
     memcpy(&icmp->data, &req->data, len);
     
     return sizeof(struct icmp_pkt) + len;
+}
+
+size_t icmp_respond() {
 }
 
 void write_to_wire(int fd, void *buf, size_t len) {
@@ -344,14 +368,98 @@ void write_to_wire(int fd, void *buf, size_t len) {
     printf("\n");
 }
 
+void process_arp_packet(int fd, void *buf) {
+    struct eth_hdr *eth = buf;
+    struct arp_pkt *arp = buf + sizeof(*eth);
+
+    print_arp_pkt(arp);
+
+    if (arp->op == htons(ARP_REQ)) {
+        void *resp = malloc(ETH_MTU);
+        // make_eth_hdr
+        size_t len = make_ip_arp_resp(resp, arp);
+        write_to_wire(fd, resp, len);
+        free(resp);
+    }
+}
+
+void process_icmp(int fd, void *buf) {
+    struct eth_hdr *eth = buf;
+    struct ip_hdr *ip = buf + sizeof(*eth);
+    struct icmp_pkt *icmp = (void *)ip + sizeof(*ip);
+
+    printf("ICMP detected, type %i\n", icmp->type);
+    if (icmp->type != ICMP_ECHO_REQ) {
+        printf("Not an echo request, ignoring\n");
+        return;
+    }
+    void *sendbuf = malloc(ETH_MTU);
+    size_t index = make_eth_hdr(sendbuf, eth->src_mac, my_mac, ETH_IP);
+    struct ip_hdr *hdr = sendbuf + index;
+    index += make_ip_hdr(hdr, ntohs(ip->id), PROTO_ICMP, ntohl(ip->src_ip));
+    struct icmp_pkt *pkt = sendbuf + index;
+    size_t icmp_data_len = ntohs(ip->total_len) - sizeof(*hdr) - sizeof(*pkt);
+    printf("total icmp data length: %i\n", icmp_data_len);
+    index += make_icmp_resp(pkt, icmp, icmp_data_len);
+    hdr->total_len = htons(index - sizeof(struct eth_hdr));
+    place_ip_checksum(hdr);
+    place_icmp_checksum(pkt, icmp_data_len);
+    write_to_wire(fd, sendbuf, index);
+    free(sendbuf);
+}
+
+void process_ip_packet(int fd, void *buf) {
+    struct eth_hdr *eth = buf;
+    struct ip_hdr *ip = buf + sizeof(*eth);
+
+    printf("IP detected, next type %x\n", ip->proto);
+    if (ip->dst_ip != htonl(my_ip)) {
+        printf("Not for my IP, ignoring\n");
+        return;
+    }
+    
+    switch (ip->proto) {
+    case PROTO_ICMP:
+        process_icmp(fd, buf);
+        break;
+    case PROTO_UDP:
+        //process_udp(fd, buf);
+        break;
+    default:
+        printf("Unknown IP protocol %i\n", ip->proto);
+        break;
+    }
+}
+
+void process_ethernet(int fd, void *buf) {
+    struct eth_hdr *eth = buf;
+
+    uint32_t dest_mac_hash = hash_mac(eth->dst_mac);
+    if (dest_mac_hash != my_mac_hash || dest_mac_hash != bcast_mac_hash) {
+        printf("Not for my MAC addr, ignoring\n");
+    }
+
+    switch (eth->ethertype) {
+    case const_htons(ETH_ARP):
+        process_arp_packet(fd, buf);
+        break;
+    case const_htons(ETH_IP):
+        process_ip_packet(fd, buf);
+        break;
+    default:
+        printf("Unknown ethertype %06#lx\n");
+        break;
+    }
+}
+
 int main() {
    
     // Global initializations - declared above 
     my_mac = mac_from_str("0e:11:22:33:44:55");
-    my_mac_hash = hash_mac_addr(my_mac);
-    my_ip = ip_from_str("10.50.1.127");
+    my_mac_hash = hash_mac(my_mac);
+    my_ip = ip_from_str("10.50.1.2");
     bcast_mac = mac_from_str("ff:ff:ff:ff:ff:ff");
-    bcast_mac_hash = hash_mac_addr(bcast_mac);
+    bcast_mac_hash = hash_mac(bcast_mac);
     zero_mac = mac_from_str("00:00:00:00:00:00");
 
     printf("my mac: %x\n", my_mac_hash);
@@ -369,7 +477,7 @@ int main() {
     }
 
     struct eth_hdr *req = malloc(ETH_MTU);
-    size_t len = make_ip_arp_req(req, "10.50.1.127", "10.50.1.1");
+    size_t len = make_ip_arp_req(req, "10.50.1.2", "10.50.1.1");
     write_to_wire(fd, req, len);
     free(req);
 
@@ -379,7 +487,7 @@ int main() {
         int count = read(fd, buf, 4096);
 
         if (count > 0) {
-            uint32_t from = hash_mac_addr(eth->dst_mac);
+            uint32_t from = hash_mac(eth->dst_mac);
             if (from != my_mac_hash && from != bcast_mac_hash) {
                 printf("Not for me - skipping\n");
                 continue;
@@ -390,47 +498,19 @@ int main() {
             }
             printf("\n");
 
-            printf("Ethertype: %#06x\n", ntohs(eth->type));
-            if (ntohs(eth->type) == 0x0806) {
-                struct arp_pkt *arp = (void *)&eth->data;
-                print_arp_pkt(arp);
-                if (ntohs(arp->op) == ARP_REQ) {
-                    struct eth_hdr *resp = malloc(ETH_MTU);
-                    size_t len = make_ip_arp_resp(resp, arp);
-                    write_to_wire(fd, resp, len);
-                    free(resp);
-                }
-            } else if (ntohs(eth->type) == 0x0800) {
+            process_ethernet(fd, buf);
+
+            /*
+            printf("Ethertype: %#06x\n", ntohs(eth->ethertype));
+
+
+
+            } else if (eth->type == htons(ETH_IP)) {
                 struct ip_hdr *ip = (void *)&eth->data;
-                printf("IP detected, next type %x\n", ip->proto);
-                if (ntohl(ip->dst_ip) != my_ip) {
-                    printf("Not for my IP, stopping\n");
-                    continue;
-                }
-                if (ip->proto == 1) {
-                    struct icmp_pkt *icmp = (void *)&ip->data;
-                    printf("ICMP detected, type %i\n", icmp->type);
-                    if (icmp->type != ICMP_ECHO_REQ) {
-                        printf("Not an echo request, ignoring\n");
-                        continue;
-                    }
-                    void *buf = malloc(ETH_MTU);
-                    size_t index = make_eth_hdr(buf, eth->src_mac, my_mac, 0x0800);
-                    struct ip_hdr *hdr = buf + index;
-                    index += make_ip_hdr(hdr, ntohs(ip->id), 1, ntohl(ip->src_ip));
-                    struct icmp_pkt *pkt = buf + index;
-                    size_t icmp_data_len = ntohs(ip->total_len) - sizeof(struct ip_hdr) - sizeof(struct icmp_pkt);
-                    printf("total icmp data length: %i\n", icmp_data_len);
-                    index += make_icmp_resp(pkt, icmp, icmp_data_len);
-                    hdr->total_len = htons(index - sizeof(struct eth_hdr));
-                    place_ip_chksm(hdr);
-                    place_icmp_chksm(pkt, icmp_data_len);
-                    write_to_wire(fd, buf, index);
-                    free(buf);
-                }
             }
 
             printf("\n");
+            */
         } else {
             printf("Read nothing - bad something\n");
         }
