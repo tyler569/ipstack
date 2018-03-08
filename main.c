@@ -120,10 +120,18 @@ struct _packed udp_pkt {
 // Defined in main();
 struct mac_addr my_mac;
 uint32_t my_mac_hash;
+
 struct mac_addr bcast_mac;
 uint32_t bcast_mac_hash;
 struct mac_addr zero_mac;
+uint32_t zero_mac_hash;
+
 uint32_t my_ip;
+
+// "arp table"
+uint32_t gateway_ip;
+struct mac_addr gateway_mac;
+uint32_t gateway_mac_hash;
 
 int tun_alloc(char *tun_name) {
     int fd = open("/dev/net/tun", O_RDWR);
@@ -192,6 +200,7 @@ void print_mac_addr(struct mac_addr mac) {
             mac.data[0], mac.data[1], mac.data[2],
             mac.data[3], mac.data[4], mac.data[5]);
 }
+
 
 uint32_t ip_from_str(char *ip_str) {
     uint32_t ip = 0;
@@ -375,14 +384,42 @@ void write_to_wire(int fd, void *buf, size_t len) {
     }
 
     printf("Wrote %i (%s)\n", len, strerror(errno));
-    printf("\n");
 }
+
+void place_arp_entry(uint32_t ip, struct mac_addr mac) {
+    uint32_t mac_hash = hash_mac(mac);
+
+    // TODO: Real ARP cache
+    if (ip == gateway_ip) {
+        gateway_mac = mac;
+        gateway_mac_hash = mac_hash;
+    }
+}
+
+struct mac_addr resolve_mac(int fd, uint32_t ip) {
+    if (ip == gateway_ip) { // ip in arp_cache
+        return gateway_mac;
+    }
+    
+    void *buf = malloc(ETH_MTU);
+    // send arp request
+    size_t len = make_ip_arp_req(buf, "10.50.1.2", "10.50.1.1");
+    write_to_wire(fd, buf, len);
+    free(buf);
+
+    return zero_mac;
+    // packets that receive this should wait for an ARP responce
+}
+    
+
 
 void process_arp_packet(int fd, void *buf) {
     struct eth_hdr *eth = buf;
     struct arp_pkt *arp = buf + sizeof(*eth);
 
     print_arp_pkt(arp);
+
+    place_arp_entry(arp->sender_ip, arp->sender_mac);
 
     if (arp->op == htons(ARP_REQ)) {
         void *resp = malloc(ETH_MTU);
@@ -391,20 +428,27 @@ void process_arp_packet(int fd, void *buf) {
         write_to_wire(fd, resp, len);
         free(resp);
     }
+
+    // TODO
+    // check to see if any packets are waiting on this IP's mac
+    // send them.
 }
 
-void process_icmp(int fd, void *buf) {
+void echo_icmp(int fd, void *buf) {
     struct eth_hdr *eth = buf;
     struct ip_hdr *ip = buf + sizeof(*eth);
     struct icmp_pkt *icmp = (void *)ip + sizeof(*ip);
+
+    struct mac_addr dest_mac = resolve_mac(fd, ntohl(ip->src_ip));
 
     printf("ICMP detected, type %i\n", icmp->type);
     if (icmp->type != ICMP_ECHO_REQ) {
         printf("Not an echo request, ignoring\n");
         return;
     }
+
     void *sendbuf = malloc(ETH_MTU);
-    size_t index = make_eth_hdr(sendbuf, eth->src_mac, my_mac, ETH_IP);
+    size_t index = make_eth_hdr(sendbuf, dest_mac, my_mac, ETH_IP);
     struct ip_hdr *hdr = sendbuf + index;
     index += make_ip_hdr(hdr, ntohs(ip->id), PROTO_ICMP, ntohl(ip->src_ip));
     struct icmp_pkt *pkt = sendbuf + index;
@@ -419,13 +463,15 @@ void process_icmp(int fd, void *buf) {
     free(sendbuf);
 }
 
-void process_udp_echo(int fd, void *buf) {
+void echo_udp(int fd, void *buf) {
     struct eth_hdr *eth = buf;
     struct ip_hdr *ip = buf + sizeof(*eth);
     struct udp_pkt *udp = (void *)ip + sizeof(*ip);
 
+    struct mac_addr dest_mac = resolve_mac(fd, ntohl(ip->src_ip));
+
     void *sendbuf = malloc(ETH_MTU);
-    size_t index = make_eth_hdr(sendbuf, eth->src_mac, my_mac, ETH_IP);
+    size_t index = make_eth_hdr(sendbuf, dest_mac, my_mac, ETH_IP);
     struct ip_hdr *sendip = sendbuf + index;
     index += make_ip_hdr(sendip, ntohs(ip->id), PROTO_UDP, ntohl(ip->src_ip));
     struct udp_pkt *sendudp = sendbuf + index;
@@ -449,10 +495,10 @@ void process_ip_packet(int fd, void *buf) {
     
     switch (ip->proto) {
     case PROTO_ICMP:
-        process_icmp(fd, buf);
+        echo_icmp(fd, buf);
         break;
     case PROTO_UDP:
-        process_udp_echo(fd, buf);
+        echo_udp(fd, buf);
         break;
     default:
         printf("Unknown IP protocol %i\n", ip->proto);
@@ -485,15 +531,17 @@ void process_ethernet(int fd, void *buf) {
 int main() {
    
     // Global initializations - declared above 
-    my_mac = mac_from_str("0e:11:22:33:44:55");
-    my_mac_hash = hash_mac(my_mac);
-    my_ip = ip_from_str("10.50.1.2");
-    bcast_mac = mac_from_str("ff:ff:ff:ff:ff:ff");
-    bcast_mac_hash = hash_mac(bcast_mac);
-    zero_mac = mac_from_str("00:00:00:00:00:00");
+    my_mac = mac_from_str("0e:11:22:33:44:55"); // hardcode
+    my_mac_hash = hash_mac(my_mac);             // hardcode
 
-    printf("my mac: %x\n", my_mac_hash);
-    printf("bcast mac: %x\n", bcast_mac_hash);
+    my_ip = ip_from_str("10.50.1.2");  // get from DHCP
+
+    bcast_mac = mac_from_str("ff:ff:ff:ff:ff:ff");  // make into constant
+    bcast_mac_hash = hash_mac(bcast_mac);           // make into constant
+    zero_mac = mac_from_str("00:00:00:00:00:00");   // make into constant
+    zero_mac_hash = hash_mac(zero_mac);             // make into constant
+
+    gateway_ip = ip_from_str("10.50.1.1");  // get from DHCP
 
     int fd = tun_alloc("tap0");
     printf("Got a file descriptor (or something)! - %i\n", fd);
