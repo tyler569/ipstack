@@ -1,5 +1,14 @@
 
 .PHONY: all
 
-all: main.c Makefile
-	cc -Wall -Wno-address-of-packed-member main.c -o net
+SRC= \
+	net.c \
+	socket.c \
+	i_udp_echo.c
+
+TARGET= net
+
+CFLAGS= -Wall -Wno-address-of-packed-member 
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $^ -pthread
