@@ -12,7 +12,7 @@
 #define BUFLEN 2048
 
 void error(const char *message) {
-    fprintf(stderr, "%s\n", message);
+    fprintf(stderr, "error: %s\n", message);
     pthread_exit((void *)-1);
 }
 

@@ -8,7 +8,7 @@ SRC= \
 
 TARGET= net
 
-CFLAGS= -Wall -Wno-address-of-packed-member 
+CFLAGS= -Wall -Wno-address-of-packed-member -g
 
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $^ -pthread

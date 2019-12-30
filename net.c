@@ -15,120 +15,19 @@
 // #include <net/if_tun.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
+#include <pthread.h>
+#include "net.h"
+#include "socket.h"
 
 const char *if_name = "tap0";
-
-#ifdef __GNUC__
-# define _packed __attribute__((packed))
-#else
-# error "Need to support non-GNUC first to ensure struct packing"
-#endif
 
 #define const_htons(x) (((x & 0xFF00) >> 8) | ((x & 0x00FF) << 8))
 
 #define ETH_MTU 1536
 
-struct _packed mac_addr {
-    char data[6];
-};
-
 bool mac_eq(struct mac_addr a, struct mac_addr b) {
     return memcmp(&a, &b, 6);
 }
-
-enum ethertype {
-    ETH_IP = 0x0800,
-    ETH_ARP = 0x0806,
-};
-
-struct _packed eth_hdr {
-    struct mac_addr dst_mac;
-    struct mac_addr src_mac;
-    uint16_t ethertype;
-    uint8_t data[0];
-};
-
-struct _packed arp_pkt {
-    // eth_hdr
-    uint16_t hw_type;
-    uint16_t proto;
-    uint8_t hw_size;
-    uint8_t proto_size;
-    uint16_t op;
-    struct mac_addr sender_mac;
-    uint32_t sender_ip;
-    struct mac_addr target_mac;
-    uint32_t target_ip;
-};
-
-enum ip_protocol_numbers {
-    PROTO_ICMP = 1,
-    PROTO_TCP = 6,
-    PROTO_UDP = 17,
-};
-
-struct _packed ip_hdr {
-    // eth_hdr
-    uint8_t hdr_len : 4;
-    uint8_t version : 4;
-    uint8_t dscp;
-    uint16_t total_len;
-    uint16_t id;
-    uint16_t flags_frag;
-    uint8_t ttl;
-    uint8_t proto;
-    uint16_t hdr_checksum;
-    uint32_t src_ip;
-    uint32_t dst_ip;
-    uint8_t data[0];
-};
-
-enum icmp_type {
-    ICMP_ECHO_REQ = 8,
-    ICMP_ECHO_RESP = 0,
-};
-
-struct _packed icmp_pkt {
-    // ip_hdr
-    uint8_t type;
-    uint8_t code;
-    uint16_t checksum;
-    uint16_t ident;
-    uint16_t sequence;
-    uint32_t timestamp;
-    uint32_t timestamp_low;
-    uint8_t data[0];
-};
-
-struct _packed udp_pkt {
-    // ip_hdr
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint16_t len;
-    uint16_t checksum;
-    uint8_t data[0];
-};
-
-struct _packed tcp_pkt {
-    // ip hdr
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint32_t seq;
-    uint32_t ack;
-    uint16_t offset : 4;
-    uint16_t _reserved : 5;
-    uint16_t f_urg : 1;
-    uint16_t f_ack : 1;
-    uint16_t f_psh : 1;
-    uint16_t f_rst : 1;
-    uint16_t f_syn : 1;
-    uint16_t f_fin : 1;
-    uint16_t window;
-    uint16_t checksum;
-    uint16_t urg_ptr;
-    uint32_t options : 24;
-    uint32_t padding : 8;
-};
 
 // Defined in main();
 struct mac_addr my_mac;
@@ -141,6 +40,9 @@ uint32_t my_ip;
 // "arp table"
 uint32_t gateway_ip;
 struct mac_addr gateway_mac;
+
+// "route table"
+int nic_fd;
 
 int tun_alloc(const char *tun_name) {
     int fd = open("/dev/net/tun", O_RDWR);
@@ -235,21 +137,16 @@ void print_ip_addr(uint32_t ip) {
             (ip >> 8) & 0xff, ip & 0xff);
 }
 
-size_t make_eth_hdr(struct eth_hdr *pkt, struct mac_addr dst, struct mac_addr src, uint16_t type) {
+size_t make_eth_hdr(struct eth_hdr *pkt, struct mac_addr dst, uint16_t type) {
     pkt->dst_mac = dst;
-    pkt->src_mac = src;
+    pkt->src_mac = my_mac;
     pkt->ethertype = htons(type);
     return sizeof(struct eth_hdr);
 }
 
-enum arp_op {
-    ARP_REQ = 1,
-    ARP_RESP = 2,
-};
-
 size_t make_ip_arp_req(void *buf, char *my_ip, char *req_ip) {
     struct eth_hdr *req = buf;
-    size_t loc = make_eth_hdr(req, bcast_mac, my_mac, 0x0806);
+    size_t loc = make_eth_hdr(req, bcast_mac, 0x0806);
 
     struct arp_pkt *arp = (void *)&req->data;
     arp->hw_type = htons(1); // Ethernet
@@ -268,7 +165,7 @@ size_t make_ip_arp_req(void *buf, char *my_ip, char *req_ip) {
 size_t make_ip_arp_resp(void *buf, struct arp_pkt *req) {
     struct eth_hdr *resp = buf;
 
-    size_t loc = make_eth_hdr(resp, req->sender_mac, my_mac, 0x0806);
+    size_t loc = make_eth_hdr(resp, req->sender_mac, 0x0806);
 
     struct arp_pkt *arp = (void *)&resp->data;
     arp->hw_type = htons(1); // Ethernet
@@ -277,7 +174,7 @@ size_t make_ip_arp_resp(void *buf, struct arp_pkt *req) {
     arp->proto_size = 4;
     arp->op = htons(ARP_RESP);
     arp->sender_mac = my_mac; // global - consider parametrizing this
-    arp->sender_ip = htonl(my_ip);
+    arp->sender_ip = my_ip;
     arp->target_mac = req->sender_mac;
     arp->target_ip = req->sender_ip;
 
@@ -315,14 +212,12 @@ void place_ip_checksum(struct ip_hdr *ip) {
     ip->hdr_checksum = ~checksum;
 }
 
-size_t make_ip_hdr(void *buf, uint16_t id, uint8_t proto, uint32_t dst_ip) {
-    struct ip_hdr *ip = buf;
-
+size_t make_ip_hdr(struct ip_hdr *ip, uint16_t id, uint8_t proto, uint32_t dst_ip) {
     ip->version = 4;
     ip->hdr_len = 5;
     ip->dscp = 0;
     ip->total_len = 0; // get later!
-    ip->id = htons(id);
+    ip->id = id;
     /*
     ip->reserved = 0;
     ip->dnf = 1;
@@ -333,8 +228,8 @@ size_t make_ip_hdr(void *buf, uint16_t id, uint8_t proto, uint32_t dst_ip) {
     ip->ttl = 255;
     ip->proto = proto;
     ip->hdr_checksum = 0; // get later!
-    ip->src_ip = htonl(my_ip);
-    ip->dst_ip = htonl(dst_ip);
+    ip->src_ip = my_ip;
+    ip->dst_ip = dst_ip;
 
     return sizeof(*ip);
 };
@@ -379,21 +274,17 @@ size_t make_udp_resp(void *buf, struct udp_pkt *req, size_t len) {
     return sizeof(*udp) + len;
 }
 
-void write_to_wire(int fd, void *buf, size_t len) {
+size_t write_to_wire(int fd, const void *buf, size_t len) {
     printf("Sending this:\n");
     for (int i=0; i<len; i++) {
         printf("%02hhx ", ((uint8_t *)buf)[i]);
     }
     printf("\n");
 
-    errno = 0;
     size_t written_len = write(fd, buf, len);
-    if (written_len != len) {
-        printf("Actually wrote %li, which is less than requested %li\n",
-                written_len, len);
-    }
 
     printf("Wrote %li (%s)\n", len, strerror(errno));
+    return written_len;
 }
 
 void place_arp_entry(uint32_t ip, struct mac_addr mac) {
@@ -418,15 +309,13 @@ struct mac_addr resolve_mac(int fd, uint32_t ip) {
     // packets that receive this should wait for an ARP responce
 }
     
-
-
 void process_arp_packet(int fd, void *buf) {
     struct eth_hdr *eth = buf;
     struct arp_pkt *arp = buf + sizeof(*eth);
 
     print_arp_pkt(arp);
 
-    place_arp_entry(ntohl(arp->sender_ip), arp->sender_mac);
+    place_arp_entry(arp->sender_ip, arp->sender_mac);
 
     if (arp->op == htons(ARP_REQ)) {
         void *resp = malloc(ETH_MTU);
@@ -446,7 +335,7 @@ void echo_icmp(int fd, void *buf) {
     struct ip_hdr *ip = buf + sizeof(*eth);
     struct icmp_pkt *icmp = (void *)ip + sizeof(*ip);
 
-    struct mac_addr dest_mac = resolve_mac(fd, ntohl(ip->src_ip));
+    struct mac_addr dest_mac = resolve_mac(fd, ip->src_ip);
 
     printf("ICMP detected, type %i\n", icmp->type);
     if (icmp->type != ICMP_ECHO_REQ) {
@@ -455,9 +344,9 @@ void echo_icmp(int fd, void *buf) {
     }
 
     void *sendbuf = malloc(ETH_MTU);
-    size_t index = make_eth_hdr(sendbuf, dest_mac, my_mac, ETH_IP);
+    size_t index = make_eth_hdr(sendbuf, dest_mac, ETH_IP);
     struct ip_hdr *hdr = sendbuf + index;
-    index += make_ip_hdr(hdr, ntohs(ip->id), PROTO_ICMP, ntohl(ip->src_ip));
+    index += make_ip_hdr(hdr, ip->id, PROTO_ICMP, ip->src_ip);
     struct icmp_pkt *pkt = sendbuf + index;
     size_t icmp_data_len = ntohs(ip->total_len) - sizeof(*hdr) - sizeof(*pkt);
     printf("total icmp data length: %li\n", icmp_data_len);
@@ -471,17 +360,18 @@ void echo_icmp(int fd, void *buf) {
     free(sendbuf);
 }
 
+/*
 void echo_udp(int fd, void *buf) {
     struct eth_hdr *eth = buf;
     struct ip_hdr *ip = buf + sizeof(*eth);
     struct udp_pkt *udp = (void *)ip + sizeof(*ip);
 
-    struct mac_addr dest_mac = resolve_mac(fd, ntohl(ip->src_ip));
+    struct mac_addr dest_mac = resolve_mac(fd, ip->src_ip);
 
     void *sendbuf = malloc(ETH_MTU);
     size_t index = make_eth_hdr(sendbuf, dest_mac, my_mac, ETH_IP);
     struct ip_hdr *sendip = sendbuf + index;
-    index += make_ip_hdr(sendip, ntohs(ip->id), PROTO_UDP, ntohl(ip->src_ip));
+    index += make_ip_hdr(sendip, ntohs(ip->id), PROTO_UDP, ip->src_ip);
     struct udp_pkt *sendudp = sendbuf + index;
     index += make_udp_resp(sendudp, udp, ntohs(ip->total_len) - sizeof(*sendip) - sizeof(*sendudp));
 
@@ -490,13 +380,14 @@ void echo_udp(int fd, void *buf) {
     write_to_wire(fd, sendbuf, index);
     free(sendbuf);
 }
+*/
 
 void process_ip_packet(int fd, void *buf) {
     struct eth_hdr *eth = buf;
     struct ip_hdr *ip = buf + sizeof(*eth);
 
     printf("IP detected, next type %#02hhx\n", ip->proto);
-    if (ip->dst_ip != htonl(my_ip)) {
+    if (ip->dst_ip != my_ip) {
         printf("Not for my IP, ignoring\n");
         return;
     }
@@ -506,7 +397,7 @@ void process_ip_packet(int fd, void *buf) {
         echo_icmp(fd, buf);
         break;
     case PROTO_UDP:
-        echo_udp(fd, buf);
+        socket_dispatch_udp(eth);
         break;
     default:
         printf("Unknown IP protocol %i\n", ip->proto);
@@ -536,18 +427,27 @@ void process_ethernet(int fd, void *buf) {
     }
 }
 
+int route(uint32_t dst_ip) {
+    // TODO real routing decisions
+    // TODO loopback
+    return nic_fd;
+}
+
+void *udp_echo(void *data);
+
 int main() {
     // Global initializations - declared above 
     my_mac = mac_from_str("0e:11:22:33:44:55"); // hardcode
 
-    my_ip = ip_from_str("10.50.1.2");  // get from DHCP
+    my_ip = htonl(ip_from_str("10.50.1.2"));  // get from DHCP
 
     bcast_mac = mac_from_str("ff:ff:ff:ff:ff:ff");  // make into constant
     zero_mac = mac_from_str("00:00:00:00:00:00");   // make into constant
 
-    gateway_ip = ip_from_str("10.50.1.1");  // get from DHCP
+    gateway_ip = htonl(ip_from_str("10.50.1.1"));  // get from DHCP
 
     int fd = tun_alloc(if_name);
+    nic_fd = fd;
     printf("Got a file descriptor (or something)! - %i\n", fd);
 
     if (fd > 0) {
@@ -562,6 +462,12 @@ int main() {
     size_t len = make_ip_arp_req(req, "10.50.1.2", "10.50.1.1");
     write_to_wire(fd, req, len);
     free(req);
+
+    pthread_t udp_echo_th;
+
+    int *port = malloc(sizeof(int));
+    *port = 1099;
+    pthread_create(&udp_echo_th, NULL, udp_echo, port);
 
     char buf[4096];
     while (true) {
@@ -584,5 +490,9 @@ int main() {
 
         memset(buf, 0, count);
     }
+
+    void *res;
+    pthread_join(udp_echo_th, &res);
+    printf("%p\n", res);
 }
 
