@@ -109,6 +109,27 @@ struct _packed udp_pkt {
     uint8_t data[0];
 };
 
+struct _packed tcp_pkt {
+    // ip hdr
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint16_t offset : 4;
+    uint16_t _reserved : 5;
+    uint16_t f_urg : 1;
+    uint16_t f_ack : 1;
+    uint16_t f_psh : 1;
+    uint16_t f_rst : 1;
+    uint16_t f_syn : 1;
+    uint16_t f_fin : 1;
+    uint16_t window;
+    uint16_t checksum;
+    uint16_t urg_ptr;
+    uint32_t options : 24;
+    uint32_t padding : 8;
+};
+
 // Defined in main();
 struct mac_addr my_mac;
 
