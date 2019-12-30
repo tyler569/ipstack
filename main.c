@@ -16,7 +16,7 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 
-// const char *tun_name = "tap0"
+const char *if_name = "tap0";
 
 #ifdef __GNUC__
 # define _packed __attribute__((packed))
@@ -32,16 +32,8 @@ struct _packed mac_addr {
     char data[6];
 };
 
-uint32_t hash_mac(struct mac_addr mac) {
-    uint32_t hash = 0;
-    hash += mac.data[5];
-    hash += mac.data[4] << 8;
-    hash += mac.data[3] << 16;
-    hash += mac.data[2];
-    hash += mac.data[1] << 8;
-    hash += mac.data[0] << 16;
-
-    return hash;
+bool mac_eq(struct mac_addr a, struct mac_addr b) {
+    return memcmp(&a, &b, 6);
 }
 
 enum ethertype {
@@ -119,21 +111,17 @@ struct _packed udp_pkt {
 
 // Defined in main();
 struct mac_addr my_mac;
-uint32_t my_mac_hash;
 
 struct mac_addr bcast_mac;
-uint32_t bcast_mac_hash;
 struct mac_addr zero_mac;
-uint32_t zero_mac_hash;
 
 uint32_t my_ip;
 
 // "arp table"
 uint32_t gateway_ip;
 struct mac_addr gateway_mac;
-uint32_t gateway_mac_hash;
 
-int tun_alloc(char *tun_name) {
+int tun_alloc(const char *tun_name) {
     int fd = open("/dev/net/tun", O_RDWR);
     if (fd < 0) {
         printf("Error: %s\n", strerror(errno));
@@ -193,6 +181,7 @@ struct mac_addr mac_from_str(char *mac_str) {
         printf("Invalid MAC address\n");
         break;
     }
+    exit(1);
 }
 
 void print_mac_addr(struct mac_addr mac) {
@@ -379,20 +368,17 @@ void write_to_wire(int fd, void *buf, size_t len) {
     errno = 0;
     size_t written_len = write(fd, buf, len);
     if (written_len != len) {
-        printf("Actually wrote %i, which is less than requested %i\n",
+        printf("Actually wrote %li, which is less than requested %li\n",
                 written_len, len);
     }
 
-    printf("Wrote %i (%s)\n", len, strerror(errno));
+    printf("Wrote %li (%s)\n", len, strerror(errno));
 }
 
 void place_arp_entry(uint32_t ip, struct mac_addr mac) {
-    uint32_t mac_hash = hash_mac(mac);
-
     // TODO: Real ARP cache
     if (ip == gateway_ip) {
         gateway_mac = mac;
-        gateway_mac_hash = mac_hash;
     }
 }
 
@@ -419,7 +405,7 @@ void process_arp_packet(int fd, void *buf) {
 
     print_arp_pkt(arp);
 
-    place_arp_entry(arp->sender_ip, arp->sender_mac);
+    place_arp_entry(ntohl(arp->sender_ip), arp->sender_mac);
 
     if (arp->op == htons(ARP_REQ)) {
         void *resp = malloc(ETH_MTU);
@@ -453,8 +439,9 @@ void echo_icmp(int fd, void *buf) {
     index += make_ip_hdr(hdr, ntohs(ip->id), PROTO_ICMP, ntohl(ip->src_ip));
     struct icmp_pkt *pkt = sendbuf + index;
     size_t icmp_data_len = ntohs(ip->total_len) - sizeof(*hdr) - sizeof(*pkt);
-    printf("total icmp data length: %i\n", icmp_data_len);
+    printf("total icmp data length: %li\n", icmp_data_len);
     index += make_icmp_resp(pkt, icmp, icmp_data_len);
+    hdr->ttl = ip->ttl;
 
     hdr->total_len = htons(index - sizeof(struct eth_hdr));
     place_ip_checksum(hdr);
@@ -508,9 +495,9 @@ void process_ip_packet(int fd, void *buf) {
 
 void process_ethernet(int fd, void *buf) {
     struct eth_hdr *eth = buf;
+    struct mac_addr dst_mac = eth->dst_mac;
 
-    uint32_t dest_mac_hash = hash_mac(eth->dst_mac);
-    if (dest_mac_hash != my_mac_hash && dest_mac_hash != bcast_mac_hash) {
+    if (mac_eq(dst_mac, my_mac) != 0 && mac_eq(dst_mac, bcast_mac) != 0) {
         printf("Not for my MAC addr, ignoring\n");
         return;
     }
@@ -529,21 +516,17 @@ void process_ethernet(int fd, void *buf) {
 }
 
 int main() {
-   
     // Global initializations - declared above 
     my_mac = mac_from_str("0e:11:22:33:44:55"); // hardcode
-    my_mac_hash = hash_mac(my_mac);             // hardcode
 
     my_ip = ip_from_str("10.50.1.2");  // get from DHCP
 
     bcast_mac = mac_from_str("ff:ff:ff:ff:ff:ff");  // make into constant
-    bcast_mac_hash = hash_mac(bcast_mac);           // make into constant
     zero_mac = mac_from_str("00:00:00:00:00:00");   // make into constant
-    zero_mac_hash = hash_mac(zero_mac);             // make into constant
 
     gateway_ip = ip_from_str("10.50.1.1");  // get from DHCP
 
-    int fd = tun_alloc("tap0");
+    int fd = tun_alloc(if_name);
     printf("Got a file descriptor (or something)! - %i\n", fd);
 
     if (fd > 0) {
