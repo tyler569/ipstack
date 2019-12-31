@@ -55,7 +55,7 @@ struct _packed ip_hdr {
     uint8_t hdr_len : 4;
     uint8_t version : 4;
     uint8_t dscp;
-    uint16_t total_len;
+    uint16_t total_length;
     uint16_t id;
     uint16_t flags_frag;
     uint8_t ttl;
@@ -98,19 +98,17 @@ struct _packed tcp_pkt {
     uint16_t dst_port;
     uint32_t seq;
     uint32_t ack;
-    uint16_t offset : 4;
-    uint16_t _reserved : 5;
-    uint16_t f_urg : 1;
-    uint16_t f_ack : 1;
-    uint16_t f_psh : 1;
-    uint16_t f_rst : 1;
-    uint16_t f_syn : 1;
     uint16_t f_fin : 1;
+    uint16_t f_syn : 1;
+    uint16_t f_rst : 1;
+    uint16_t f_psh : 1;
+    uint16_t f_ack : 1;
+    uint16_t f_urg : 1;
+    uint16_t _reserved : 6;
+    uint16_t offset : 4;
     uint16_t window;
     uint16_t checksum;
     uint16_t urg_ptr;
-    uint32_t options : 24;
-    uint32_t padding : 8;
 };
 
 enum arp_op {
@@ -122,6 +120,7 @@ struct mac_addr resolve_mac(int fd, uint32_t ip);
 size_t make_eth_hdr(struct eth_hdr *pkt, struct mac_addr, uint16_t ethertype);
 size_t make_ip_hdr(struct ip_hdr *, uint16_t id, uint8_t proto, uint32_t dst);
 void place_ip_checksum(struct ip_hdr *);
+void place_tcp_checksum(struct ip_hdr *);
 size_t write_to_wire(int fd, const void *, size_t);
 int route(uint32_t ip);
 

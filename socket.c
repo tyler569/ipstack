@@ -19,10 +19,25 @@ enum socket_state {
     OUTBOUND,
 };
 
+enum tcp_state {
+    LISTEN,
+    SYN_SENT,
+    SYN_RECIEVED,
+    ESTABLISHED,
+    FIN_WAIT_1,
+    FIN_WAIT_2,
+    CLOSE_WAIT,
+    CLOSING,
+    LAST_ACK,
+    TIME_WAIT,
+    CLOSED,
+};
+
 struct accept_data {
     // IPism
     uint32_t remote_ip;
     uint16_t remote_port;
+    uint32_t remote_seq;
 };
 
 struct socket_impl {
@@ -42,17 +57,33 @@ struct socket_impl {
     uint32_t remote_ip;
     uint16_t remote_port;
 
-    pthread_mutex_t listen_mtx;
-    pthread_cond_t listen_cond;
-    struct accept_data accept_data;
-
     pthread_mutex_t data_mtx;
     pthread_cond_t data_cond;
     void *pending_data;
     int pending_data_len;
     uint32_t pending_remote_ip;
     uint16_t pending_remote_port;
+
+    pthread_mutex_t listen_mtx;
+    pthread_cond_t listen_cond;
+    struct accept_data accept_data;
+
+    // TCP {{
+    // HOST byte order
+    uint32_t send_seq; // SND.NXT
+    uint32_t send_ack; // SND.UNA
+    uint32_t recv_seq; // RCV.NXT
+    uint16_t window_size;
+
+    char *recv_buffer; // [window]
+    char *send_buffer; // for retx
+
+    enum tcp_state tcp_state;
+    // }}
 };
+
+void tcp_syn(struct socket_impl *);
+void tcp_syn_ack(struct socket_impl *);
 
 #define N_MAXSOCKETS 256
 
@@ -124,6 +155,8 @@ int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     struct socket_impl *s = sockets + sockfd;
     if (!s->valid) return -1;
 
+    if (!(s->type == SOCK_STREAM)) return -1;
+
     pthread_mutex_lock(&s->listen_mtx);
     pthread_cond_wait(&s->listen_cond, &s->listen_mtx);
 
@@ -131,16 +164,13 @@ int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     if (i == -1) return -1;
 
     struct socket_impl *as = sockets + i;
-    as->valid = true;
-    as->domain = s->domain;
-    as->type = s->type;
-    as->protocol = s->protocol;
-    as->local_ip = s->local_ip;
-    as->local_port = s->local_port;
 
-    as->remote_ip = s->accept_data.remote_ip;
-    as->remote_port = s->accept_data.remote_port;
+    memcpy(as, s, sizeof(struct socket_impl));
     as->state = OUTBOUND;
+    as->tcp_state = SYN_RECIEVED;
+    as->remote_ip = as->accept_data.remote_ip;
+    as->remote_port = as->accept_data.remote_port;
+    as->recv_seq = as->accept_data.remote_seq;
 
     struct sockaddr_in in_addr = {
         .sin_family = AF_INET,
@@ -150,6 +180,8 @@ int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 
     memcpy(addr, &in_addr, sizeof(in_addr));
     *addrlen = sizeof(in_addr);
+
+    tcp_syn_ack(s);
 
     pthread_mutex_unlock(&s->listen_mtx);
     return i;
@@ -165,7 +197,9 @@ int i_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     s->remote_ip = in_addr->sin_addr.s_addr;
     s->remote_port = in_addr->sin_port;
 
-    // setup? SYN?
+    if (s->protocol == IPPROTO_TCP) {
+        tcp_syn(s);
+    }
 
     s->state = OUTBOUND;
     return 0;
@@ -216,7 +250,7 @@ ssize_t i_sendto(int sockfd, const void *buf, size_t len, int flags,
     memcpy(data, buf, len);
     index += len;
 
-    ip->total_len = htons(index - sizeof(struct eth_hdr));
+    ip->total_length = htons(index - sizeof(struct eth_hdr));
     place_ip_checksum(ip);
 
     write_to_wire(fd, pkt, index);
@@ -329,5 +363,140 @@ void socket_dispatch_udp(struct eth_hdr *eth) {
     pthread_mutex_lock(&s->data_mtx);
     pthread_cond_signal(&s->data_cond);
     pthread_mutex_unlock(&s->data_mtx);
+}
+
+void tcp_syn(struct socket_impl *s) {
+    s->send_seq = 0;
+    s->send_ack = 0;
+    s->recv_seq = 0;
+
+    int fd = route(s->remote_ip);
+    int len = sizeof(struct eth_hdr) +
+              sizeof(struct ip_hdr) +
+              sizeof(struct tcp_pkt);
+    void *pkt = malloc(len);
+    struct eth_hdr *eth = pkt;
+    struct mac_addr dst_mac = resolve_mac(fd, s->remote_ip);
+    make_eth_hdr(pkt, dst_mac, ETH_IP);
+    struct ip_hdr *ip = (void *)(eth + 1);
+    make_ip_hdr(ip, htons(s->ip_id), PROTO_TCP, s->remote_ip);
+    s->ip_id += 1;
+    struct tcp_pkt *tcp = (void *)(ip + 1);
+    tcp->src_port = s->local_port;
+    tcp->dst_port = s->remote_port;
+    tcp->seq = s->send_seq;
+    tcp->ack = 0;
+    tcp->offset = 5;
+    tcp->_reserved = 0;
+    tcp->f_urg = 0;
+    tcp->f_ack = 0;
+    tcp->f_psh = 0;
+    tcp->f_rst = 0;
+    tcp->f_syn = 1;
+    tcp->f_fin = 0;
+    tcp->window = htons(0x1000);
+    tcp->checksum = 0;
+    tcp->urg_ptr = 0;
+    ip->total_length = htons(len - sizeof(struct eth_hdr));
+    place_tcp_checksum(ip);
+    place_ip_checksum(ip);
+
+    write_to_wire(fd, pkt, len);
+}
+
+void tcp_syn_ack(struct socket_impl *s) {
+    s->send_seq = 0;
+    s->send_ack = 0;
+
+    int fd = route(s->remote_ip);
+    int len = sizeof(struct eth_hdr) +
+              sizeof(struct ip_hdr) +
+              sizeof(struct tcp_pkt);
+    void *pkt = malloc(len);
+    struct eth_hdr *eth = pkt;
+    struct mac_addr dst_mac = resolve_mac(fd, s->remote_ip);
+    make_eth_hdr(pkt, dst_mac, ETH_IP);
+    struct ip_hdr *ip = (void *)(eth + 1);
+    make_ip_hdr(ip, htons(s->ip_id), PROTO_TCP, s->remote_ip);
+    s->ip_id += 1;
+    struct tcp_pkt *tcp = (void *)(ip + 1);
+    // COPYPASTA from tcp_syn
+    tcp->src_port = s->local_port;
+    tcp->dst_port = s->remote_port;
+    tcp->seq = s->send_seq;
+    tcp->ack = s->recv_seq;
+    tcp->offset = 5;
+    tcp->_reserved = 0;
+    tcp->f_urg = 0;
+    tcp->f_ack = 1;
+    tcp->f_psh = 0;
+    tcp->f_rst = 0;
+    tcp->f_syn = 1;
+    tcp->f_fin = 0;
+    tcp->window = htons(0x1000);
+    tcp->checksum = 0;
+    tcp->urg_ptr = 0;
+    ip->total_length = htons(len - sizeof(struct eth_hdr));
+    place_tcp_checksum(ip);
+    place_ip_checksum(ip);
+
+    write_to_wire(fd, pkt, len);
+}
+
+void socket_dispatch_tcp(struct eth_hdr *eth) {
+    struct ip_hdr *ip = (void *)(eth + 1);
+    struct tcp_pkt *tcp = (void *)(ip + 1);
+
+    int best_match = -1;
+    for (int i=0; i<N_MAXSOCKETS; i++) {
+        int strength = 0;
+        struct socket_impl *s = sockets + i;
+
+        if (!(s->valid)) continue;
+        if (!(s->domain == AF_INET)) continue;
+        if (!(s->type == SOCK_STREAM)) continue;
+        if (!(s->protocol == IPPROTO_TCP)) continue;
+
+        if (s->local_ip == ip->dst_ip) strength++;
+        if (s->local_port == tcp->dst_port) strength++;
+
+        if (s->state == LISTENING && s->local_ip == 0) strength++;
+
+        if (s->state == OUTBOUND) {
+            if (s->remote_ip == ip->src_ip) strength++;
+            if (s->remote_port == tcp->src_port) strength++;
+        }
+
+        if (s->state == LISTENING && strength == 2) {
+            best_match = i;
+            break;
+        }
+
+        if (s->state == OUTBOUND && strength == 4) {
+            best_match = i;
+            break;
+        }
+    }
+    if (best_match == -1) {
+        // no matching socket, drop.
+        return;
+    }
+    printf("dispatch found match: %i\n", best_match);
+    struct socket_impl *s = sockets + best_match;
+
+    if (s->state == LISTENING) {
+        s->accept_data.remote_ip = ip->src_ip;
+        s->accept_data.remote_port = tcp->src_port;
+        s->accept_data.remote_seq = tcp->seq;
+
+        pthread_mutex_lock(&s->listen_mtx);
+        pthread_cond_signal(&s->listen_cond);
+        pthread_mutex_unlock(&s->listen_mtx);
+
+        // accept runs the syn/ack
+    }
+
+    // segment things
+    // TODO
 }
 

@@ -212,11 +212,55 @@ void place_ip_checksum(struct ip_hdr *ip) {
     ip->hdr_checksum = ~checksum;
 }
 
+struct tcp_pseudoheader {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint8_t _zero;
+    uint8_t protocol;
+    uint16_t tcp_length;
+};
+
+void place_tcp_checksum(struct ip_hdr *ip) {
+    struct tcp_pkt *tcp = (void *)(ip + 1);
+
+    int length = ntohs(ip->total_length);
+
+    struct tcp_pseudoheader t = {
+        ip->src_ip,
+        ip->dst_ip,
+        0,
+        PROTO_TCP,
+        length,
+    };
+
+    uint32_t checksum32 = 0;
+    uint16_t *c = (uint16_t *)&t;
+    for (int i=0; i<sizeof(t)/2; i++) {
+        checksum32 += c[i];
+    }
+
+    int n_bytes = length - sizeof(struct ip_hdr);
+    c = (uint16_t *)tcp;
+    for (int i=0; i<n_bytes/2; i++) {
+        checksum32 += c[i];
+    }
+
+    if (n_bytes % 2 != 0) {
+        uint16_t last = ((uint8_t *)ip)[length-1];
+        last <<= 8;
+        checksum32 += last;
+    }
+
+    uint16_t checksum = (checksum32 & 0xFFFF) + (checksum32 >> 16);
+
+    tcp->checksum = ~checksum;
+}   
+
 size_t make_ip_hdr(struct ip_hdr *ip, uint16_t id, uint8_t proto, uint32_t dst_ip) {
     ip->version = 4;
     ip->hdr_len = 5;
     ip->dscp = 0;
-    ip->total_len = 0; // get later!
+    ip->total_length = 0; // get later!
     ip->id = id;
     /*
     ip->reserved = 0;
@@ -348,12 +392,12 @@ void echo_icmp(int fd, void *buf) {
     struct ip_hdr *hdr = sendbuf + index;
     index += make_ip_hdr(hdr, ip->id, PROTO_ICMP, ip->src_ip);
     struct icmp_pkt *pkt = sendbuf + index;
-    size_t icmp_data_len = ntohs(ip->total_len) - sizeof(*hdr) - sizeof(*pkt);
+    size_t icmp_data_len = ntohs(ip->total_length) - sizeof(*hdr) - sizeof(*pkt);
     printf("total icmp data length: %li\n", icmp_data_len);
     index += make_icmp_resp(pkt, icmp, icmp_data_len);
     hdr->ttl = ip->ttl;
 
-    hdr->total_len = htons(index - sizeof(struct eth_hdr));
+    hdr->total_length = htons(index - sizeof(struct eth_hdr));
     place_ip_checksum(hdr);
     place_icmp_checksum(pkt, icmp_data_len);
     write_to_wire(fd, sendbuf, index);
@@ -373,9 +417,9 @@ void echo_udp(int fd, void *buf) {
     struct ip_hdr *sendip = sendbuf + index;
     index += make_ip_hdr(sendip, ntohs(ip->id), PROTO_UDP, ip->src_ip);
     struct udp_pkt *sendudp = sendbuf + index;
-    index += make_udp_resp(sendudp, udp, ntohs(ip->total_len) - sizeof(*sendip) - sizeof(*sendudp));
+    index += make_udp_resp(sendudp, udp, ntohs(ip->total_length) - sizeof(*sendip) - sizeof(*sendudp));
 
-    sendip->total_len = htons(index - sizeof(struct eth_hdr));
+    sendip->total_length = htons(index - sizeof(struct eth_hdr));
     place_ip_checksum(sendip);
     write_to_wire(fd, sendbuf, index);
     free(sendbuf);
@@ -434,6 +478,7 @@ int route(uint32_t dst_ip) {
 }
 
 void *udp_echo(void *data);
+void *tcp_out(void *data);
 
 int main() {
     // Global initializations - declared above 
@@ -463,11 +508,13 @@ int main() {
     write_to_wire(fd, req, len);
     free(req);
 
-    pthread_t udp_echo_th;
+    pthread_t udp_echo_th, tcp_out_th;
 
     int *port = malloc(sizeof(int));
     *port = 1099;
     pthread_create(&udp_echo_th, NULL, udp_echo, port);
+
+    int did_tcp = 0;
 
     char buf[4096];
     while (true) {
@@ -487,6 +534,17 @@ int main() {
         printf("\n");
 
         process_ethernet(fd, buf);
+
+        if (mac_eq(gateway_mac, zero_mac) == 0) {
+            struct eth_hdr *req = malloc(ETH_MTU);
+            size_t len = make_ip_arp_req(req, "10.50.1.2", "10.50.1.1");
+            write_to_wire(fd, req, len);
+            free(req);
+        }
+        if (mac_eq(gateway_mac, zero_mac) != 0 && !did_tcp) {
+            did_tcp = true;
+            pthread_create(&tcp_out_th, NULL, tcp_out, port);
+        }
 
         memset(buf, 0, count);
     }
