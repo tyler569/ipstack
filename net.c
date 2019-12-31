@@ -230,30 +230,30 @@ void place_tcp_checksum(struct ip_hdr *ip) {
         ip->dst_ip,
         0,
         PROTO_TCP,
-        length,
+        htons(length - sizeof(struct ip_hdr)),
     };
 
-    uint32_t checksum32 = 0;
+    uint32_t sum = 0;
     uint16_t *c = (uint16_t *)&t;
     for (int i=0; i<sizeof(t)/2; i++) {
-        checksum32 += c[i];
+        sum += c[i];
     }
 
     int n_bytes = length - sizeof(struct ip_hdr);
     c = (uint16_t *)tcp;
     for (int i=0; i<n_bytes/2; i++) {
-        checksum32 += c[i];
+        sum += c[i];
     }
 
     if (n_bytes % 2 != 0) {
         uint16_t last = ((uint8_t *)ip)[length-1];
-        last <<= 8;
-        checksum32 += last;
+        sum += last;
     }
 
-    uint16_t checksum = (checksum32 & 0xFFFF) + (checksum32 >> 16);
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
 
-    tcp->checksum = ~checksum;
+    tcp->checksum = ~(uint16_t)sum;
 }   
 
 size_t make_ip_hdr(struct ip_hdr *ip, uint16_t id, uint8_t proto, uint32_t dst_ip) {

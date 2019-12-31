@@ -388,6 +388,7 @@ void tcp_syn(struct socket_impl *s) {
     tcp->ack = 0;
     tcp->offset = 5;
     tcp->_reserved = 0;
+    tcp->_reserved2 = 0;
     tcp->f_urg = 0;
     tcp->f_ack = 0;
     tcp->f_psh = 0;
@@ -427,6 +428,7 @@ void tcp_syn_ack(struct socket_impl *s) {
     tcp->ack = s->recv_seq;
     tcp->offset = 5;
     tcp->_reserved = 0;
+    tcp->_reserved2 = 0;
     tcp->f_urg = 0;
     tcp->f_ack = 1;
     tcp->f_psh = 0;
