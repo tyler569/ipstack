@@ -448,8 +448,12 @@ void socket_dispatch_udp(struct eth_hdr *eth) {
     pthread_mutex_unlock(&s->data_mtx);
 }
 
+size_t tcp_len(tcp_pkt *tcp) {
+    return tcp->offset * 4;
+}
+
 void tcp_syn(struct socket_impl *s) {
-    s->send_seq = 0;
+    s->send_seq = rand();
     s->send_ack = 0;
     s->recv_seq = 0;
 
@@ -623,9 +627,13 @@ void socket_dispatch_tcp(struct eth_hdr *eth) {
     printf("dispatch found match: %i\n", best_match);
     struct socket_impl *s = sockets + best_match;
 
+    uint16_t ip_len = ntohs(ip->total_length);
+    uint32_t tcp_rseq = ntohl(tcp->seq);
+    uint32_t tcp_rack = ntohl(tcp->ack);
+
     // ACK sequence update
     if (tcp->f_ack) {
-        s->send_ack = ntohl(tcp->ack);
+        s->send_ack = tcp_rack;
     }
 
     // SYN -> RST
@@ -639,7 +647,7 @@ void socket_dispatch_tcp(struct eth_hdr *eth) {
     // SYN -> SYN/ACK
     if (s->tcp_state == SYN_SENT && tcp->f_syn && tcp->f_ack) {
         require_that(s->send_ack == s->send_seq);
-        s->recv_seq = ntohl(tcp->seq) + 1; // SYN is ~ 1 byte
+        s->recv_seq = tcp_rseq + 1; // SYN is ~ 1 byte
         tcp_ack(s);
 
         s->tcp_state = ESTABLISHED;
@@ -649,12 +657,17 @@ void socket_dispatch_tcp(struct eth_hdr *eth) {
         pthread_mutex_unlock(&s->ack_mtx);
     }
 
-    if (ntohl(tcp->seq) > s->recv_seq) {
+    uint32_t new_seq = tcp_rseq + ip_len - sizeof(ip_hdr) - tcp_len(tcp);
+    if (tcp->f_fin) {
+        new_seq += 1;
+    }
+
+    if (new_seq > s->recv_seq) { // TODO MODULO 2**32
         // TODO: save data
         // TODO: ack data
         // TODO: make available to application
         printf("TCP: data available, just acking.\n");
-        s->recv_seq = ntohl(tcp->seq);
+        s->recv_seq = new_seq;
         tcp_ack(s);
     }
 

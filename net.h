@@ -112,6 +112,12 @@ struct _packed tcp_pkt {
     uint16_t urg_ptr;
 };
 
+typedef struct mac_addr mac_addr;
+typedef struct eth_hdr eth_hdr;
+typedef struct ip_hdr ip_hdr;
+typedef struct udp_pkt udp_pkt;
+typedef struct tcp_pkt tcp_pkt;
+
 enum arp_op {
     ARP_REQ = 1,
     ARP_RESP = 2,

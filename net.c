@@ -529,12 +529,14 @@ int main() {
             exit(0);
         }
 
+        /*
         printf("\n");
         printf("Read this from the socket:\n");
         for (int i=0; i<count; i++) {
             printf("%02hhx ", buf[i]);
         }
         printf("\n");
+        */
 
         process_ethernet(fd, buf);
 
