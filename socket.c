@@ -87,7 +87,8 @@ struct socket_impl {
 };
 
 void tcp_syn(struct socket_impl *);
-void tcp_syn_ack(struct socket_impl *);
+void tcp_ack(struct socket_impl *);
+// void tcp_connect(struct socket_impl *);
 
 #define N_MAXSOCKETS 256
 
@@ -215,7 +216,7 @@ int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     memcpy(addr, &in_addr, sizeof(in_addr));
     *addrlen = sizeof(in_addr);
 
-    tcp_syn_ack(s);
+    tcp_ack(s);
 
     pthread_mutex_unlock(&s->listen_mtx);
     return i;
@@ -240,12 +241,12 @@ int i_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
     if (s->protocol == IPPROTO_TCP) {
         pthread_mutex_lock(&s->ack_mtx);
-        tcp_syn(s);
+        tcp_syn(s); // + timeout
 
         pthread_cond_wait(&s->ack_cond, &s->ack_mtx);
         pthread_mutex_unlock(&s->ack_mtx);
 
-        if (s->tcp_state != SYN_SENT) {
+        if (s->tcp_state != ESTABLISHED) {
             errno = ECONNREFUSED;
             return -1;
         }
@@ -457,7 +458,7 @@ void tcp_syn(struct socket_impl *s) {
     struct tcp_pkt *tcp = (void *)(ip + 1);
     tcp->src_port = s->local_port;
     tcp->dst_port = s->remote_port;
-    tcp->seq = s->send_seq;
+    tcp->seq = htonl(s->send_seq);
     tcp->ack = 0;
     tcp->offset = 5;
     tcp->_reserved = 0;
@@ -477,13 +478,11 @@ void tcp_syn(struct socket_impl *s) {
 
     write_to_wire(fd, pkt, len);
 
+    s->send_seq += 1; // SYN is ~ 1 byte.
     s->tcp_state = SYN_SENT;
 }
 
-void tcp_syn_ack(struct socket_impl *s) {
-    s->send_seq = 0;
-    s->send_ack = 0;
-
+void tcp_ack(struct socket_impl *s) {
     int fd = route(s->remote_ip);
     int len = sizeof(struct eth_hdr) +
               sizeof(struct ip_hdr) +
@@ -499,8 +498,8 @@ void tcp_syn_ack(struct socket_impl *s) {
     // COPYPASTA from tcp_syn
     tcp->src_port = s->local_port;
     tcp->dst_port = s->remote_port;
-    tcp->seq = s->send_seq;
-    tcp->ack = s->recv_seq;
+    tcp->seq = htonl(s->send_seq);
+    tcp->ack = htonl(s->recv_seq);
     tcp->offset = 5;
     tcp->_reserved = 0;
     tcp->_reserved2 = 0;
@@ -508,7 +507,11 @@ void tcp_syn_ack(struct socket_impl *s) {
     tcp->f_ack = 1;
     tcp->f_psh = 0;
     tcp->f_rst = 0;
-    tcp->f_syn = 1;
+    if (s->tcp_state == LISTEN) {
+        tcp->f_syn = 1;
+    } else {
+        tcp->f_syn = 0;
+    }
     tcp->f_fin = 0;
     tcp->window = htons(0x1000);
     tcp->checksum = 0;
@@ -518,7 +521,13 @@ void tcp_syn_ack(struct socket_impl *s) {
     place_ip_checksum(ip);
 
     write_to_wire(fd, pkt, len);
+
+    if (tcp->f_syn || tcp->f_fin) {
+        s->send_seq += 1;
+    }
 }
+
+void require_that(bool x) {}
 
 void socket_dispatch_tcp(struct eth_hdr *eth) {
     struct ip_hdr *ip = (void *)(eth + 1);
@@ -563,6 +572,19 @@ void socket_dispatch_tcp(struct eth_hdr *eth) {
 
     if (s->tcp_state == SYN_SENT && tcp->f_rst) {
         s->tcp_state = CLOSED;
+        pthread_mutex_lock(&s->ack_mtx);
+        pthread_cond_signal(&s->ack_cond);
+        pthread_mutex_unlock(&s->ack_mtx);
+    }
+
+    if (s->tcp_state == SYN_SENT && tcp->f_syn && tcp->f_ack) {
+        s->send_ack = ntohl(tcp->ack);
+        require_that(s->send_ack == s->send_seq);
+        s->recv_seq = ntohl(tcp->seq) + 1; // SYN is ~ 1 byte
+        tcp_ack(s);
+
+        s->tcp_state = ESTABLISHED;
+
         pthread_mutex_lock(&s->ack_mtx);
         pthread_cond_signal(&s->ack_cond);
         pthread_mutex_unlock(&s->ack_mtx);

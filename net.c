@@ -514,7 +514,7 @@ int main() {
     pthread_t udp_echo_th, tcp_out_th;
 
     int *port = malloc(sizeof(int));
-    *port = 1099;
+    *port = 1100;
     pthread_create(&udp_echo_th, NULL, udp_echo, port);
 
     int did_tcp = 0;
