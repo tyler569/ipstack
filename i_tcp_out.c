@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
@@ -22,13 +23,16 @@ void *tcp_out(void *arg) {
     int *pport = arg;
     int port = *pport;
 
+    srand(time(0));
+    uint16_t my_port = rand();
+
     int sock = i_socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) error("i_socket");
 
     struct sockaddr_in bind_addr = {
         .sin_family = AF_INET,
         .sin_addr = {0x0201320a}, // 10.50.1.2 TODO 0 binds
-        .sin_port = htons(5100),
+        .sin_port = htons(my_port),
     };
 
     res = i_bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
