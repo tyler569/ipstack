@@ -9,6 +9,7 @@
 #include <netinet/ip.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <errno.h>
 #include "net.h"
 
 enum socket_state {
@@ -78,6 +79,9 @@ struct socket_impl {
     char *recv_buffer; // [window]
     char *send_buffer; // for retx
 
+    pthread_mutex_t ack_mtx;
+    pthread_cond_t ack_cond;
+
     enum tcp_state tcp_state;
     // }}
 };
@@ -103,12 +107,16 @@ static int next_avail() {
 int i_socket(int domain, int type, int protocol) {
     int i = next_avail();
     if (i == -1) {
+        errno = ENOMEM;
         return -1;
     }
 
     struct socket_impl *s = sockets + i;
 
-    if (domain != AF_INET) return -1;
+    if (domain != AF_INET) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
 
     // TODO we could validate these inputs
     if (type == SOCK_STREAM) protocol = IPPROTO_TCP;
@@ -123,10 +131,16 @@ int i_socket(int domain, int type, int protocol) {
 
 int i_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) return -1;
+    if (!s->valid) {
+        errno = ENOTSOCK;
+        return -1;
+    }
 
     struct sockaddr_in *in_addr = (struct sockaddr_in *)addr;
-    if (in_addr->sin_family != AF_INET) return -1;
+    if (in_addr->sin_family != AF_INET) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
 
     s->local_ip = in_addr->sin_addr.s_addr;
     s->local_port = in_addr->sin_port;
@@ -136,16 +150,27 @@ int i_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
     s->state = BOUND;
     return 0;
+
 }
 
 int i_listen(int sockfd, int backlog) {
     struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) return -1;
+    if (!s->valid) {
+        errno = ENOTSOCK;
+        return -1;
+    }
 
     int res = pthread_mutex_init(&s->listen_mtx, NULL);
-    if (res != 0) return -1;
-    res = pthread_cond_init(&s->listen_cond, NULL);
-    if (res != 0) return -1;
+    if (res != 0) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    pthread_cond_init(&s->listen_cond, NULL);
+    if (res != 0) {
+        errno = EFAULT;
+        return -1;
+    }
 
     s->state = LISTENING;
     return 0;
@@ -153,15 +178,24 @@ int i_listen(int sockfd, int backlog) {
 
 int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) return -1;
+    if (!s->valid) {
+        errno = ENOTSOCK;
+        return -1;
+    }
 
-    if (!(s->type == SOCK_STREAM)) return -1;
+    if (!(s->type == SOCK_STREAM)) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
 
     pthread_mutex_lock(&s->listen_mtx);
     pthread_cond_wait(&s->listen_cond, &s->listen_mtx);
 
     int i = next_avail();
-    if (i == -1) return -1;
+    if (i == -1) {
+        errno = ENOMEM;
+        return -1;
+    }
 
     struct socket_impl *as = sockets + i;
 
@@ -189,42 +223,71 @@ int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 
 int i_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) return -1;
+    if (!s->valid) {
+        errno = ENOTSOCK;
+        return -1;
+    }
 
     const struct sockaddr_in *in_addr = (const struct sockaddr_in *)addr;
-    if (in_addr->sin_family != AF_INET) return -1;
+    if (in_addr->sin_family != AF_INET) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
 
     s->remote_ip = in_addr->sin_addr.s_addr;
     s->remote_port = in_addr->sin_port;
+    s->state = OUTBOUND;
 
     if (s->protocol == IPPROTO_TCP) {
+        pthread_mutex_lock(&s->ack_mtx);
         tcp_syn(s);
+
+        pthread_cond_wait(&s->ack_cond, &s->ack_mtx);
+        pthread_mutex_unlock(&s->ack_mtx);
+
+        if (s->tcp_state != SYN_SENT) {
+            errno = ECONNREFUSED;
+            return -1;
+        }
     }
 
-    s->state = OUTBOUND;
     return 0;
 }
 
 ssize_t i_send(int sockfd, const void *buf, size_t len, int flags) {
     struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) return -1;
+    if (!s->valid) {
+        errno = ENOTSOCK;
+        return -1;
+    }
 
-    if (s->state != OUTBOUND) return -1;
+    if (s->state != OUTBOUND) {
+        errno = EDESTADDRREQ;
+        return -1;
+    }
 
+    errno = 1000;
     return -1; // ETODO
 }
 
 ssize_t i_sendto(int sockfd, const void *buf, size_t len, int flags,
         const struct sockaddr *dest_addr, socklen_t addrlen) {
     struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) return -1;
+    if (!s->valid) {
+        errno = ENOTSOCK;
+        return -1;
+    }
 
     if (s->type != SOCK_DGRAM) {
-        return -1; // ETODO;
+        errno = EFAULT; // TODO
+        return -1;
     }
 
     struct sockaddr_in *in_addr = (struct sockaddr_in *)dest_addr;
-    if (addrlen != sizeof(*in_addr)) return -1;
+    if (addrlen != sizeof(*in_addr)) {
+        errno = EFAULT; // TODO ? How do you handle this?
+        return -1;
+    }
 
     int pkt_len = sizeof(struct eth_hdr) +
                   sizeof(struct ip_hdr) + 
@@ -260,21 +323,31 @@ ssize_t i_sendto(int sockfd, const void *buf, size_t len, int flags,
 
 ssize_t i_recv(int sockfd, void *bud, size_t len, int flags) {
     struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) return -1;
+    if (!s->valid) {
+        errno = ENOTSOCK;
+        return -1;
+    }
 
+    errno = 1000;
     return -1; // ETODO
 }
 
 ssize_t i_recvfrom(int sockfd, void *buf, size_t len, int flags,
         struct sockaddr *src_addr, socklen_t *addrlen) {
     struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) return -1;
+    if (!s->valid) {
+        errno = ENOTSOCK;
+        return -1;
+    }
 
     pthread_mutex_lock(&s->data_mtx);
     pthread_cond_wait(&s->data_cond, &s->data_mtx);
 
     struct sockaddr_in *in_addr = (struct sockaddr_in *)src_addr;
-    if (*addrlen < sizeof(*in_addr)) return -1;
+    if (*addrlen < sizeof(*in_addr)) {
+        errno = EFAULT;
+        return -1;
+    }
     in_addr->sin_family = AF_INET;
     in_addr->sin_port = s->pending_remote_port;
     in_addr->sin_addr.s_addr = s->pending_remote_ip;
@@ -403,6 +476,8 @@ void tcp_syn(struct socket_impl *s) {
     place_ip_checksum(ip);
 
     write_to_wire(fd, pkt, len);
+
+    s->tcp_state = SYN_SENT;
 }
 
 void tcp_syn_ack(struct socket_impl *s) {
@@ -485,6 +560,18 @@ void socket_dispatch_tcp(struct eth_hdr *eth) {
     }
     printf("dispatch found match: %i\n", best_match);
     struct socket_impl *s = sockets + best_match;
+
+    if (s->tcp_state == SYN_SENT && tcp->f_rst) {
+        s->tcp_state = CLOSED;
+        pthread_mutex_lock(&s->ack_mtx);
+        pthread_cond_signal(&s->ack_cond);
+        pthread_mutex_unlock(&s->ack_mtx);
+    }
+
+    if (tcp->f_rst) {
+        printf("TCP RST\n");
+        return;
+    }
 
     if (s->state == LISTENING) {
         s->accept_data.remote_ip = ip->src_ip;

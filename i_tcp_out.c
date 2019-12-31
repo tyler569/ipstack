@@ -7,13 +7,14 @@
 #include <sys/socket.h>
 #include <netinet/ip.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 #include "socket.h"
 
 #define BUFLEN 2048
 
 static void error(const char *message) {
-    fprintf(stderr, "error %s\n", message);
-    exit(1);
+    perror(message);
+    pthread_exit((void *)-1);
 }
 
 void *tcp_out(void *arg) {

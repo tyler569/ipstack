@@ -443,6 +443,9 @@ void process_ip_packet(int fd, void *buf) {
     case PROTO_UDP:
         socket_dispatch_udp(eth);
         break;
+    case PROTO_TCP:
+        socket_dispatch_tcp(eth);
+        break;
     default:
         printf("Unknown IP protocol %i\n", ip->proto);
         break;

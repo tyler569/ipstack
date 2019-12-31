@@ -19,6 +19,7 @@ ssize_t i_recvfrom(int sockfd, void *buf, size_t len, int flags,
         struct sockaddr *src_addr, socklen_t *addrlen);
 
 void socket_dispatch_udp(struct eth_hdr *);
+void socket_dispatch_tcp(struct eth_hdr *);
 
 #endif // IPSTACK_SOCKET_H
 
