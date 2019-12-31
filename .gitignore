@@ -1,3 +1,5 @@
 net
 *.o
 udp_echo
+tcp_echo
+tcp_out
