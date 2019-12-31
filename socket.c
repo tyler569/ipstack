@@ -88,6 +88,7 @@ struct socket_impl {
 
 void tcp_syn(struct socket_impl *);
 void tcp_ack(struct socket_impl *);
+void tcp_send(struct socket_impl *, const void *, size_t);
 // void tcp_connect(struct socket_impl *);
 
 #define N_MAXSOCKETS 256
@@ -267,8 +268,16 @@ ssize_t i_send(int sockfd, const void *buf, size_t len, int flags) {
         return -1;
     }
 
-    errno = 1000;
-    return -1; // ETODO
+    if (s->type == SOCK_DGRAM) {
+        errno = 1000;
+        // UDP TODO
+        return -1;
+    }
+
+    if (s->type == SOCK_STREAM) {
+        tcp_send(s, buf, len);
+    }
+    return len;
 }
 
 ssize_t i_sendto(int sockfd, const void *buf, size_t len, int flags,
@@ -527,6 +536,50 @@ void tcp_ack(struct socket_impl *s) {
     }
 }
 
+void tcp_send(struct socket_impl *s, const void *data, size_t len) {
+    int fd = route(s->remote_ip);
+    int plen = sizeof(struct eth_hdr) +
+              sizeof(struct ip_hdr) +
+              sizeof(struct tcp_pkt) +
+              len;
+    void *pkt = malloc(plen);
+    struct eth_hdr *eth = pkt;
+    struct mac_addr dst_mac = resolve_mac(fd, s->remote_ip);
+    make_eth_hdr(pkt, dst_mac, ETH_IP);
+    struct ip_hdr *ip = (void *)(eth + 1);
+    make_ip_hdr(ip, htons(s->ip_id), PROTO_TCP, s->remote_ip);
+    s->ip_id += 1;
+    struct tcp_pkt *tcp = (void *)(ip + 1);
+    void *pdata = (void *)(tcp + 1);
+    // COPYPASTA from tcp_syn
+    tcp->src_port = s->local_port;
+    tcp->dst_port = s->remote_port;
+    tcp->seq = htonl(s->send_seq);
+    tcp->ack = htonl(s->recv_seq);
+    tcp->offset = 5;
+    tcp->_reserved = 0;
+    tcp->_reserved2 = 0;
+    tcp->f_urg = 0;
+    tcp->f_ack = 1;
+    tcp->f_psh = 0;
+    tcp->f_rst = 0;
+    tcp->f_syn = 0;
+    tcp->f_fin = 0;
+    tcp->window = htons(0x1000);
+    tcp->checksum = 0;
+    tcp->urg_ptr = 0;
+    ip->total_length = htons(plen - sizeof(struct eth_hdr));
+
+    memcpy(pdata, data, len);
+
+    place_tcp_checksum(ip);
+    place_ip_checksum(ip);
+
+    write_to_wire(fd, pkt, plen);
+
+    s->send_seq += len;
+}
+
 void require_that(bool x) {}
 
 void socket_dispatch_tcp(struct eth_hdr *eth) {
@@ -570,6 +623,12 @@ void socket_dispatch_tcp(struct eth_hdr *eth) {
     printf("dispatch found match: %i\n", best_match);
     struct socket_impl *s = sockets + best_match;
 
+    // ACK sequence update
+    if (tcp->f_ack) {
+        s->send_ack = ntohl(tcp->ack);
+    }
+
+    // SYN -> RST
     if (s->tcp_state == SYN_SENT && tcp->f_rst) {
         s->tcp_state = CLOSED;
         pthread_mutex_lock(&s->ack_mtx);
@@ -577,8 +636,8 @@ void socket_dispatch_tcp(struct eth_hdr *eth) {
         pthread_mutex_unlock(&s->ack_mtx);
     }
 
+    // SYN -> SYN/ACK
     if (s->tcp_state == SYN_SENT && tcp->f_syn && tcp->f_ack) {
-        s->send_ack = ntohl(tcp->ack);
         require_that(s->send_ack == s->send_seq);
         s->recv_seq = ntohl(tcp->seq) + 1; // SYN is ~ 1 byte
         tcp_ack(s);
@@ -590,6 +649,16 @@ void socket_dispatch_tcp(struct eth_hdr *eth) {
         pthread_mutex_unlock(&s->ack_mtx);
     }
 
+    if (ntohl(tcp->seq) > s->recv_seq) {
+        // TODO: save data
+        // TODO: ack data
+        // TODO: make available to application
+        printf("TCP: data available, just acking.\n");
+        s->recv_seq = ntohl(tcp->seq);
+        tcp_ack(s);
+    }
+
+    // RST
     if (tcp->f_rst) {
         printf("TCP RST\n");
         return;

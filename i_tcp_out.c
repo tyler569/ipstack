@@ -48,7 +48,8 @@ void *tcp_out(void *arg) {
     if (res < 0) error("i_connect");
 
     const char *message = "Hello World\n";
-    i_send(sock, message, strlen(message), 0);
+    res = i_send(sock, message, strlen(message), 0);
+    if (res < 0) error("i_send");
 
     while (true) {
         char buf[BUFLEN];
