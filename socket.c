@@ -662,7 +662,9 @@ void socket_dispatch_tcp(struct eth_hdr *eth) {
         new_seq += 1;
     }
 
-    if (new_seq > s->recv_seq) { // TODO MODULO 2**32
+    if (s->tcp_state == ESTABLISHED && new_seq > s->recv_seq) {
+        // TODO ^^ MODULO 2**32
+        //
         // TODO: save data
         // TODO: ack data
         // TODO: make available to application
