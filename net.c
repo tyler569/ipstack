@@ -12,12 +12,12 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <net/if.h>
-// #include <net/if_tun.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <pthread.h>
 #include "net.h"
-#include "socket.h"
+#include "list.h"
+// #include "socket.h"
 
 const char *if_name = "tap0";
 
@@ -25,24 +25,372 @@ const char *if_name = "tap0";
 
 #define ETH_MTU 1536
 
-bool mac_eq(struct mac_addr a, struct mac_addr b) {
+
+#define ARRAY_LEN(array) (sizeof(array) / sizeof(*(array)))
+
+
+bool mac_eq(struct mac_address a, struct mac_address b) {
     return memcmp(&a, &b, 6);
 }
 
-// Defined in main();
-struct mac_addr my_mac;
+const struct mac_address broadcast_mac = {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
+const struct mac_address zero_mac = {{0, 0, 0, 0, 0, 0}};
 
-struct mac_addr bcast_mac;
-struct mac_addr zero_mac;
 
-uint32_t my_ip;
+typedef uint32_t be32;
+typedef uint16_t be16;
 
-// "arp table"
-uint32_t gateway_ip;
-struct mac_addr gateway_mac;
 
-// "route table"
-int nic_fd;
+struct sock {
+};
+struct udp_sock {
+    struct sock sock;
+    int ip_id;
+    be32 source_ip;
+    be32 destination_ip;
+    be32 source_port;
+    be32 destination_port;
+};
+
+
+struct route {
+    be32 prefix;
+    be32 netmask;
+    be32 next_hop;
+};
+
+struct route route_table[1];
+
+be32 best_route(be32 address) {
+    int best_prefix = -1;
+    int best_next_hop = 0;
+    for (int i=0; i<ARRAY_LEN(route_table); i++) {
+        if ((address & route_table[i].netmask) == route_table[i].prefix) {
+            if (route_table[i].prefix > best_prefix) {
+                best_next_hop = route_table[i].next_hop;
+                best_prefix = route_table[i].prefix;
+            }
+        }
+    }
+
+    return best_next_hop;
+}
+
+struct pkb;
+
+struct arp_cache_line {
+    be32 ip;
+    struct mac_address mac;
+};
+
+struct arp_cache {
+#define ARP_CACHE_LEN 32
+    struct arp_cache_line cl[ARP_CACHE_LEN];
+};
+
+
+struct net_if {
+    struct mac_address mac_address;
+    be32 ip;
+    be32 netmask;
+
+#if __linux__
+    int fd;
+#elif __ngk__
+    struct net_if *intf;
+#endif
+
+    struct arp_cache arp_cache;
+    struct list pending_mac_queries;
+
+    size_t (*write_to_wire)(struct net_if *, struct pkb *);
+};
+
+struct pkb {
+    uint8_t anno[32];
+    struct net_if *from;
+    long length; // -1 if unknown
+
+    char buffer[];
+};
+
+struct pkb *new_pkb() {
+    struct pkb *new_pk = calloc(1, sizeof(struct pkb) + ETH_MTU);
+    new_pk->length = -1;
+    new_pk->from = NULL;
+    return new_pk;
+}
+
+void free_pkb(struct pkb *pkb) {
+    free(pkb);
+}
+
+
+struct ethernet_header;
+struct arp_header;
+struct ip4_header;
+struct icmp_header;
+struct udp_header;
+
+struct tcp_socket;
+struct udp_socket;
+struct icmp_socket; // ?
+struct ip_socket; // raw sockets?
+
+
+struct ethernet_header *ethernet(struct pkb *pk) {
+    return (struct ethernet_header *)&pk->buffer;
+}
+
+struct arp_header *arp(struct pkb *pk) {
+    return (struct arp_header *)&pk->buffer + sizeof(struct ethernet_header);
+}
+
+struct ip4_header *ip4(struct pkb *pk) {
+    return (struct ip4_header *)&pk->buffer + sizeof(struct ethernet_header);
+}
+
+struct udp_header *udp(struct ip4_header *ip4) {
+    return (struct udp_header *)((char *)ip4 + (ip4->header_length * 32));
+}
+
+struct icmp_header *icmp(struct ip4_header *ip4) {
+    return (struct icmp_header *)((char *)ip4 + (ip4->header_length * 32));
+}
+
+long ip_len(struct pkb *pk) {
+    struct ethernet_header *eth = ethernet(pk);
+    if (eth->ethertype != htons(ETH_IP)) {
+        return 0;
+    }
+
+    struct ip4_header *ip = ip4(pk);
+    return ip->total_length + sizeof(struct ethernet_header);
+}
+
+
+// below
+void reply_icmp(struct pkb *resp, struct pkb *pk);
+
+// below
+void ip_checksum(struct pkb *);
+void icmp_checksum(struct pkb *);
+
+// TODO
+void udp_checksum(struct pkb *);
+
+// below
+void dispatch(struct pkb *);
+
+void echo_icmp(struct pkb *pk) {
+    struct pkb *resp = new_pkb();
+    reply_icmp(resp, pk);
+    dispatch(resp);
+    free_pkb(resp);
+}
+
+void reply_icmp(struct pkb *resp, struct pkb *pk) {
+    struct ethernet_header *r_eth = ethernet(resp);
+    r_eth->ethertype = htons(ETH_ARP);
+
+    struct ip4_header *r_ip4 = ip4(resp);
+    struct ip4_header *s_ip4 = ip4(pk);
+
+    r_ip4->version = 4;
+    r_ip4->header_length = 5;
+    r_ip4->dscp = 0;
+    r_ip4->total_length = 0;
+    r_ip4->id = s_ip4->id;
+    r_ip4->flags_frag = htons(0x4000); // DNF - make this better
+    r_ip4->ttl = 64;
+    r_ip4->proto = IPPROTO_ICMP;
+    r_ip4->source_ip = s_ip4->destination_ip;
+    r_ip4->destination_ip = s_ip4->source_ip;
+
+    struct icmp_header *r_icmp = icmp(r_ip4);
+    struct icmp_header *s_icmp = icmp(s_ip4);
+
+    size_t icmp_data_len = htons(s_ip4->total_length) -
+                           sizeof(struct ip4_header) - 
+                           sizeof(struct icmp_header);
+
+    r_icmp->type = ICMP_ECHO_RESP;
+    r_icmp->code = 0;
+    r_icmp->checksum = 0;
+    r_icmp->ident = s_icmp->ident;
+    r_icmp->sequence = s_icmp->sequence;
+    r_icmp->timestamp = s_icmp->timestamp;
+    r_icmp->timestamp_low = s_icmp->timestamp_low;
+
+    memcpy(r_icmp->data, s_icmp->data, icmp_data_len);
+
+    ip_checksum(resp);
+    icmp_checksum(resp);
+
+    resp->length = ip_len(resp);
+}
+
+void make_udp(struct udp_sock *sock, struct pkb *pk, void *data, size_t len) {
+    struct ethernet_header *r_eth = ethernet(pk);
+    r_eth->ethertype = htons(ETH_ARP);
+
+    struct ip4_header *r_ip4 = ip4(pk);
+
+    r_ip4->version = 4;
+    r_ip4->header_length = 5;
+    r_ip4->dscp = 0;
+    r_ip4->total_length = sizeof(struct ip4_header) + sizeof(struct udp_header) + len;
+    r_ip4->id = sock->ip_id;
+    r_ip4->flags_frag = htons(0x4000); // DNF - make this better
+    r_ip4->ttl = 64;
+    r_ip4->proto = IPPROTO_ICMP;
+    r_ip4->source_ip = sock->source_ip;
+    r_ip4->destination_ip = sock->destination_ip;
+
+    struct udp_header *r_udp = udp(r_ip4);
+
+    r_udp->source_port = sock->source_port;
+    r_udp->destination_port = sock->destination_port;
+    r_udp->length = len;
+    r_udp->checksum = 0;
+
+    memcpy(r_udp->data, data, len);
+
+    ip_checksum(pk);
+    udp_checksum(pk);
+}
+
+// below
+void query_for(struct net_if *intf, be32 address, struct pkb *pk);
+struct mac_address arp_cache_get(struct net_if *intf, be32 ip);
+
+// TODO
+struct net_if *interface_containing(be32 ip);
+
+void dispatch(struct pkb *pk) {
+    struct ip4_header *ip = ip4(pk);
+    be32 next_hop = best_route(ip->destination_ip);
+
+    struct net_if *intf = interface_containing(next_hop);
+    if (next_hop == intf->ip) {
+        // it was me all along!
+    }
+
+    struct mac_address d;
+    d = arp_cache_get(intf, next_hop);
+
+    if (!mac_eq(d, zero_mac)) {
+        struct ethernet_header *eth = ethernet(pk);
+        eth->source_mac = intf->mac_address;
+        eth->destination_mac = d;
+
+        intf->write_to_wire(intf, pk);
+    } else {
+        query_for(intf, next_hop, pk);
+    }
+}
+
+struct pending_mac_query {
+    be32 ip;
+    struct mac_address mac;
+
+    int attempts;
+
+    struct list pending_pks;
+};
+
+
+void arp_cache_put(struct net_if *intf, be32 ip, struct mac_address mac) {
+    struct arp_cache *ac = &intf->arp_cache;
+
+    for (int i=0; i<ARP_CACHE_LEN; i++) {
+        if (ac->cl[i].ip == 0) {
+            ac->cl[i].ip = ip;
+            ac->cl[i].mac = mac;
+        }
+    }
+
+    struct list_n *node = intf->pending_mac_queries.head;
+    while (node) {
+        struct pending_mac_query *q = node->v;
+
+        if (q->ip == ip) {
+            // TODO
+            // allow the packets out with the new MAC as destination
+            break;
+        }
+    }
+}
+
+struct mac_address arp_cache_get(struct net_if *intf, be32 ip) {
+    struct arp_cache *ac = &intf->arp_cache;
+
+    for (int i=0; i<ARP_CACHE_LEN; i++) {
+        if (ip && ac->cl[i].ip == ip) {
+            return ac->cl[i].mac;
+        }
+    }
+
+    return zero_mac;
+}
+
+// below
+void arp_query(struct pkb *pk, be32 address, struct net_if *intf);
+
+void query_for(struct net_if *intf, be32 address, struct pkb *pk) {
+    struct list_n *node = intf->pending_mac_queries.head;
+
+    while (node) {
+        struct pending_mac_query *q = node->v;
+        if (address == q->ip) {
+            if (pk) {
+                list_append(&q->pending_pks, pk);
+            }
+            return;
+        }
+        node = node->next;
+    }
+
+    // The query has not been sent
+
+    struct pending_mac_query *q = malloc(sizeof(*q));
+
+    q->ip = address;
+    q->mac = zero_mac;
+    q->attempts = 1;
+    q->pending_pks.head = NULL;
+    q->pending_pks.tail = NULL;
+
+    list_append(&q->pending_pks, pk);
+    list_append(&intf->pending_mac_queries, q);
+
+    struct pkb *arp = new_pkb();
+    arp_query(arp, address, intf);
+    intf->write_to_wire(intf, arp);
+}
+
+
+void arp_query(struct pkb *pk, be32 address, struct net_if *intf) {
+    struct ethernet_header *eth = ethernet(pk);
+    eth->destination_mac = broadcast_mac;
+    eth->source_mac = intf->mac_address;
+    eth->ethertype = htons(ETH_ARP);
+
+    struct arp_header *r_arp = arp(pk);
+    r_arp->hw_type = htons(1);      // ethernet
+    r_arp->proto = htons(0x0800);   // ip4
+    r_arp->hw_size = 6;
+    r_arp->proto_size = 4;
+    r_arp->op = htons(ARP_REQ);
+    r_arp->sender_mac = intf->mac_address;
+    r_arp->sender_ip = intf->ip;
+    r_arp->target_mac = zero_mac;
+    r_arp->target_ip = address;
+
+    pk->length = sizeof(struct ethernet_header) +
+                 sizeof(struct arp_header);
+}
+
 
 int tun_alloc(const char *tun_name) {
     int fd = open("/dev/net/tun", O_RDWR);
@@ -65,8 +413,8 @@ int tun_alloc(const char *tun_name) {
     return fd;
 }
 
-struct mac_addr mac_from_str_trad(char *mac_str) {
-    struct mac_addr res = {0};
+struct mac_address mac_from_str_trad(char *mac_str) {
+    struct mac_address res = {0};
     char *end;
     for (int i=0; i<6; i++) {
         res.data[i] = strtol(mac_str, &end, 16);
@@ -84,7 +432,7 @@ struct mac_addr mac_from_str_trad(char *mac_str) {
     return res;
 }
 
-struct mac_addr mac_from_str(char *mac_str) {
+struct mac_address mac_from_str(char *mac_str) {
     // accepts 3 formats:
     //  no punctuation: 00180a334455
     //  traditional   : 00:18:0a:33:44:55
@@ -107,7 +455,7 @@ struct mac_addr mac_from_str(char *mac_str) {
     exit(1);
 }
 
-void print_mac_addr(struct mac_addr mac) {
+void print_mac_address(struct mac_address mac) {
     printf("%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx", 
             mac.data[0], mac.data[1], mac.data[2],
             mac.data[3], mac.data[4], mac.data[5]);
@@ -137,81 +485,49 @@ void print_ip_addr(uint32_t ip) {
             (ip >> 8) & 0xff, ip & 0xff);
 }
 
-size_t make_eth_hdr(struct eth_hdr *pkt, struct mac_addr dst, uint16_t type) {
-    pkt->dst_mac = dst;
-    pkt->src_mac = my_mac;
-    pkt->ethertype = htons(type);
-    return sizeof(struct eth_hdr);
-}
+void print_arp_pkt(struct pkb *pk) {
+    struct arp_header *a = arp(pk);
 
-size_t make_ip_arp_req(void *buf, char *my_ip, char *req_ip) {
-    struct eth_hdr *req = buf;
-    size_t loc = make_eth_hdr(req, bcast_mac, 0x0806);
-
-    struct arp_pkt *arp = (void *)&req->data;
-    arp->hw_type = htons(1); // Ethernet
-    arp->proto = htons(0x0800); // IP
-    arp->hw_size = 6;
-    arp->proto_size = 4;
-    arp->op = htons(ARP_REQ);
-    arp->sender_mac = my_mac; // global - consider parametrizing this
-    arp->sender_ip = htonl(ip_from_str(my_ip));
-    arp->target_mac = zero_mac;
-    arp->target_ip = htonl(ip_from_str(req_ip));
-
-    return loc + sizeof(*arp);
-}
-
-size_t make_ip_arp_resp(void *buf, struct arp_pkt *req) {
-    struct eth_hdr *resp = buf;
-
-    size_t loc = make_eth_hdr(resp, req->sender_mac, 0x0806);
-
-    struct arp_pkt *arp = (void *)&resp->data;
-    arp->hw_type = htons(1); // Ethernet
-    arp->proto = htons(0x0800); // IP
-    arp->hw_size = 6;
-    arp->proto_size = 4;
-    arp->op = htons(ARP_RESP);
-    arp->sender_mac = my_mac; // global - consider parametrizing this
-    arp->sender_ip = my_ip;
-    arp->target_mac = req->sender_mac;
-    arp->target_ip = req->sender_ip;
-
-    return loc + sizeof(*arp);
-}
-
-
-void print_arp_pkt(struct arp_pkt *arp) {
-    int op = ntohs(arp->op);
+    int op = ntohs(a->op);
     if (op == ARP_REQ) {
         printf("ARP Request who-has ");
-        print_ip_addr(ntohl(arp->target_ip));
+        print_ip_addr(ntohl(a->target_ip));
         printf(" tell ");
-        print_ip_addr(ntohl(arp->sender_ip));
+        print_ip_addr(ntohl(a->sender_ip));
         printf("\n");
     } else if (op == ARP_RESP) {
         printf("ARP Responce ");
-        print_ip_addr(ntohl(arp->sender_ip));
+        print_ip_addr(ntohl(a->sender_ip));
         printf(" is-at ");
-        print_mac_addr(arp->sender_mac);
+        print_mac_address(a->sender_mac);
         printf("\n");
     } else {
-        printf("Unrecognised ARP OP: %i\n", ntohs(arp->op));
+        printf("Unrecognised ARP OP: %i\n", ntohs(a->op));
     }
 }
 
-void place_ip_checksum(struct ip_hdr *ip) {
+void ip_checksum(struct pkb *pk) {
+    struct ip4_header *ip = ip4(pk);
+
     uint16_t *ip_chunks = (uint16_t *)ip;
     uint32_t checksum32 = 0;
-    for (int i=0; i<ip->hdr_len*2; i+=1) {
+    for (int i=0; i<ip->header_length*2; i+=1) {
         checksum32 += ip_chunks[i];
     }
     uint16_t checksum = (checksum32 & 0xFFFF) + (checksum32 >> 16);
 
-    ip->hdr_checksum = ~checksum;
+    ip->header_checksum = ~checksum;
 }
 
+void udp_checksum(struct pkb *pk) {
+    struct ip4_header *ip = ip4(pk);
+    struct udp_header *u = udp(ip);
+
+    // TODO actually calculate UDP checksums
+    u->checksum = 0;
+}
+
+/*
 struct tcp_pseudoheader {
     uint32_t src_ip;
     uint32_t dst_ip;
@@ -255,70 +571,42 @@ void place_tcp_checksum(struct ip_hdr *ip) {
 
     tcp->checksum = ~(uint16_t)sum;
 }   
+*/
 
-size_t make_ip_hdr(struct ip_hdr *ip, uint16_t id, uint8_t proto, uint32_t dst_ip) {
-    ip->version = 4;
-    ip->hdr_len = 5;
-    ip->dscp = 0;
-    ip->total_length = 0; // get later!
-    ip->id = id;
-    /*
-    ip->reserved = 0;
-    ip->dnf = 1;
-    ip->_reserved0 = 0;
-    ip->frag_off = 0;
-    */
-    ip->flags_frag = htons(0x4000); // dnf
-    ip->ttl = 255;
-    ip->proto = proto;
-    ip->hdr_checksum = 0; // get later!
-    ip->src_ip = my_ip;
-    ip->dst_ip = dst_ip;
+void icmp_checksum(struct pkb *pk) {
+    struct ip4_header *r_ip4 = ip4(pk);
+    struct icmp_header *r_icmp = icmp(r_ip4);
 
-    return sizeof(*ip);
-};
+    size_t extra_len = r_ip4->total_length -
+                        sizeof(struct ip4_header) -
+                        sizeof(struct icmp_header);
 
-void place_icmp_checksum(struct icmp_pkt *icmp, size_t extra_len) {
-    uint16_t *icmp_chunks = (uint16_t *)icmp;
+    uint16_t *icmp_chunks = (uint16_t *)r_icmp;
     uint32_t checksum32 = 0;
-    for (int i=0; i<(sizeof(struct icmp_pkt) + extra_len)/2; i+=1) {
+    for (int i=0; i<(sizeof(struct icmp_header) + extra_len)/2; i+=1) {
         checksum32 += icmp_chunks[i];
     }
     uint16_t checksum = (checksum32 & 0xFFFF) + (checksum32 >> 16);
 
-    icmp->checksum = ~checksum;
+    r_icmp->checksum = ~checksum;
 }
 
-size_t make_icmp_resp(void *buf, struct icmp_pkt *req, size_t len) {
-    struct icmp_pkt *icmp = buf;
-    
-    icmp->type = ICMP_ECHO_RESP;
-    icmp->code = 0;
-    icmp->checksum = 0; // get later!
-    icmp->ident = req->ident; // stays in network byte-order
-    icmp->sequence = req->sequence; // stays in network byte-order
-    icmp->timestamp = req->timestamp; // stays in network byte-order
-    icmp->timestamp_low = req->timestamp_low; // stays in network byte-order
+size_t linux_write_to_wire(struct net_if *intf, struct pkb *pk) {
+    int fd = intf->fd;
+    long len;
+    void *buf = pk->buffer;
 
-    memcpy(&icmp->data, &req->data, len);
-    
-    return sizeof(*icmp) + len;
-}
+    struct ip4_header *ip;
 
-size_t make_udp_resp(void *buf, struct udp_pkt *req, size_t len) {
-    struct udp_pkt *udp = buf;
+    if (pk->length > 0) {
+        len = pk->length;
+    } else if ((ip = ip4(pk))) {
+        len = ip->total_length + sizeof(struct ethernet_header);
+    } else {
+        printf("length unknown for pkb!\n");
+        return -1;
+    }
 
-    udp->src_port = req->dst_port;
-    udp->dst_port = req->src_port;
-    udp->len = req->len;
-    udp->checksum = 0; // checksum disabled;
-
-    memcpy(&udp->data, &req->data, len);
-
-    return sizeof(*udp) + len;
-}
-
-size_t write_to_wire(int fd, const void *buf, size_t len) {
     printf("Sending this:\n");
     for (int i=0; i<len; i++) {
         printf("%02hhx ", ((uint8_t *)buf)[i]);
@@ -331,120 +619,60 @@ size_t write_to_wire(int fd, const void *buf, size_t len) {
     return written_len;
 }
 
-void place_arp_entry(uint32_t ip, struct mac_addr mac) {
-    // TODO: Real ARP cache
-    if (ip == gateway_ip) {
-        gateway_mac = mac;
+void arp_reply(struct pkb *resp, struct pkb *pk) {
+    struct ethernet_header *r_eth = ethernet(resp);
+    struct arp_header *s_arp = arp(pk);
+    struct arp_header *r_arp = arp(resp);
+
+    r_eth->source_mac = pk->from->mac_address;
+    r_eth->destination_mac = broadcast_mac;
+    r_eth->ethertype = htons(ETH_ARP);
+
+    r_arp->hw_type = htons(1);      // ethernet
+    r_arp->proto = htons(0x0800);   // ip4
+    r_arp->hw_size = 6;
+    r_arp->proto_size = 4;
+    r_arp->op = htons(ARP_REQ);
+    r_arp->sender_mac = pk->from->mac_address;
+    r_arp->sender_ip = pk->from->ip;
+    r_arp->target_mac = s_arp->sender_mac;
+    r_arp->target_ip = s_arp->sender_ip;
+
+    resp->length = sizeof(struct ethernet_header) +
+                   sizeof(struct arp_header);
+}
+
+void process_arp_packet(struct pkb *pk) {
+    print_arp_pkt(pk);
+    struct arp_header *a = arp(pk);
+    arp_cache_put(pk->from, a->sender_ip, a->sender_mac);
+
+    if (a->op == htons(ARP_REQ) && a->target_ip == pk->from->ip) {
+        struct pkb *resp = new_pkb();
+        arp_reply(resp, pk);
+        pk->from->write_to_wire(pk->from, resp);
+        free_pkb(resp);
     }
 }
 
-struct mac_addr resolve_mac(int fd, uint32_t ip) {
-    if (ip == gateway_ip) { // ip in arp_cache
-        return gateway_mac;
-    }
-    
-    void *buf = malloc(ETH_MTU);
-    // send arp request
-    size_t len = make_ip_arp_req(buf, "10.50.1.2", "10.50.1.1");
-    write_to_wire(fd, buf, len);
-    free(buf);
-
-    return zero_mac;
-    // packets that receive this should wait for an ARP responce
-}
-    
-void process_arp_packet(int fd, void *buf) {
-    struct eth_hdr *eth = buf;
-    struct arp_pkt *arp = buf + sizeof(*eth);
-
-    print_arp_pkt(arp);
-
-    place_arp_entry(arp->sender_ip, arp->sender_mac);
-
-    if (arp->op == htons(ARP_REQ)) {
-        void *resp = malloc(ETH_MTU);
-        // make_eth_hdr
-        size_t len = make_ip_arp_resp(resp, arp);
-        write_to_wire(fd, resp, len);
-        free(resp);
-    }
-
-    // TODO
-    // check to see if any packets are waiting on this IP's mac
-    // send them.
-}
-
-void echo_icmp(int fd, void *buf) {
-    struct eth_hdr *eth = buf;
-    struct ip_hdr *ip = buf + sizeof(*eth);
-    struct icmp_pkt *icmp = (void *)ip + sizeof(*ip);
-
-    struct mac_addr dest_mac = resolve_mac(fd, ip->src_ip);
-
-    printf("ICMP detected, type %i\n", icmp->type);
-    if (icmp->type != ICMP_ECHO_REQ) {
-        printf("Not an echo request, ignoring\n");
-        return;
-    }
-
-    void *sendbuf = malloc(ETH_MTU);
-    size_t index = make_eth_hdr(sendbuf, dest_mac, ETH_IP);
-    struct ip_hdr *hdr = sendbuf + index;
-    index += make_ip_hdr(hdr, ip->id, PROTO_ICMP, ip->src_ip);
-    struct icmp_pkt *pkt = sendbuf + index;
-    size_t icmp_data_len = ntohs(ip->total_length) - sizeof(*hdr) - sizeof(*pkt);
-    printf("total icmp data length: %li\n", icmp_data_len);
-    index += make_icmp_resp(pkt, icmp, icmp_data_len);
-    hdr->ttl = ip->ttl;
-
-    hdr->total_length = htons(index - sizeof(struct eth_hdr));
-    place_ip_checksum(hdr);
-    place_icmp_checksum(pkt, icmp_data_len);
-    write_to_wire(fd, sendbuf, index);
-    free(sendbuf);
-}
-
-/*
-void echo_udp(int fd, void *buf) {
-    struct eth_hdr *eth = buf;
-    struct ip_hdr *ip = buf + sizeof(*eth);
-    struct udp_pkt *udp = (void *)ip + sizeof(*ip);
-
-    struct mac_addr dest_mac = resolve_mac(fd, ip->src_ip);
-
-    void *sendbuf = malloc(ETH_MTU);
-    size_t index = make_eth_hdr(sendbuf, dest_mac, my_mac, ETH_IP);
-    struct ip_hdr *sendip = sendbuf + index;
-    index += make_ip_hdr(sendip, ntohs(ip->id), PROTO_UDP, ip->src_ip);
-    struct udp_pkt *sendudp = sendbuf + index;
-    index += make_udp_resp(sendudp, udp, ntohs(ip->total_length) - sizeof(*sendip) - sizeof(*sendudp));
-
-    sendip->total_length = htons(index - sizeof(struct eth_hdr));
-    place_ip_checksum(sendip);
-    write_to_wire(fd, sendbuf, index);
-    free(sendbuf);
-}
-*/
-
-void process_ip_packet(int fd, void *buf) {
-    struct eth_hdr *eth = buf;
-    struct ip_hdr *ip = buf + sizeof(*eth);
+void process_ip_packet(struct pkb *pk) {
+    struct ip4_header *ip = ip4(pk);
 
     printf("IP detected, next type %#02hhx\n", ip->proto);
-    if (ip->dst_ip != my_ip) {
+    if (ip->destination_ip != pk->from->ip) {
         printf("Not for my IP, ignoring\n");
         return;
     }
     
     switch (ip->proto) {
     case PROTO_ICMP:
-        echo_icmp(fd, buf);
+        echo_icmp(pk);
         break;
     case PROTO_UDP:
-        socket_dispatch_udp(eth);
+        // socket_dispatch_udp(pk);
         break;
     case PROTO_TCP:
-        socket_dispatch_tcp(eth);
+        // socket_dispatch_tcp(pk);
         break;
     default:
         printf("Unknown IP protocol %i\n", ip->proto);
@@ -452,110 +680,78 @@ void process_ip_packet(int fd, void *buf) {
     }
 }
 
-void process_ethernet(int fd, void *buf) {
-    struct eth_hdr *eth = buf;
-    struct mac_addr dst_mac = eth->dst_mac;
+void process_ethernet(struct pkb *pk) {
+    struct ethernet_header *eth = ethernet(pk);
+    struct mac_address dst_mac = eth->destination_mac;
+    struct mac_address my_mac = pk->from->mac_address;
 
-    if (mac_eq(dst_mac, my_mac) != 0 && mac_eq(dst_mac, bcast_mac) != 0) {
+    if (mac_eq(dst_mac, my_mac) != 0 && mac_eq(dst_mac, broadcast_mac) != 0) {
         printf("Not for my MAC addr, ignoring\n");
         return;
     }
 
-    switch (eth->ethertype) {
-    case const_htons(ETH_ARP):
-        process_arp_packet(fd, buf);
+    switch (ntohs(eth->ethertype)) {
+    case ETH_ARP:
+        process_arp_packet(pk);
         break;
-    case const_htons(ETH_IP):
-        process_ip_packet(fd, buf);
+    case ETH_IP:
+        process_ip_packet(pk);
         break;
     default:
-        printf("Unknown ethertype %#06hx\n", htons(eth->ethertype));
+        printf("Unknown ethertype %#06hx\n", ntohs(eth->ethertype));
         break;
     }
 }
 
-int route(uint32_t dst_ip) {
-    // TODO real routing decisions
-    // TODO loopback
-    return nic_fd;
+struct net_if interfaces[] = {
+    {
+        .mac_address = {{0x02, 0x00, 0x00, 0x12, 0x34, 0x56}},
+        .ip = 0xac1f0102,
+        .netmask = 0xffffff00,
+        .fd = -1,
+        .arp_cache = {},
+        .pending_mac_queries = {0},
+        .write_to_wire = linux_write_to_wire,
+    },
+};
+
+struct net_if *interface_containing(be32 ip) {
+    if (ip == interfaces[0].ip) {
+        return &interfaces[0];
+    } else {
+        return NULL;
+    }
 }
 
-void *udp_echo(void *data);
-void *tcp_out(void *data);
+struct route route_table[] = {
+    {0x00000000, 0x00000000, 0xac1f0101}, // 172.31.1.1
+};
 
 int main() {
-    // Global initializations - declared above 
-    my_mac = mac_from_str("0e:11:22:33:44:55"); // hardcode
-
-    my_ip = htonl(ip_from_str("10.50.1.2"));  // get from DHCP
-
-    bcast_mac = mac_from_str("ff:ff:ff:ff:ff:ff");  // make into constant
-    zero_mac = mac_from_str("00:00:00:00:00:00");   // make into constant
-
-    gateway_ip = htonl(ip_from_str("10.50.1.1"));  // get from DHCP
+    init_global_lists();
 
     int fd = tun_alloc(if_name);
-    nic_fd = fd;
-    printf("Got a file descriptor (or something)! - %i\n", fd);
-
-    if (fd > 0) {
-        printf("It's probably real too, let's try it!\n");
-    } else {
-        printf("Imma guess it's not good though, and die here\n");
-        printf("Did you make that tun adapter and set it up?\n");
-        exit(0);
+    if (fd < 0) {
+        perror("tun_alloc");
     }
 
-    struct eth_hdr *req = malloc(ETH_MTU);
-    size_t len = make_ip_arp_req(req, "10.50.1.2", "10.50.1.1");
-    write_to_wire(fd, req, len);
-    free(req);
+    interfaces[0].fd = fd;
 
-    pthread_t udp_echo_th, tcp_out_th;
-
-    int *port = malloc(sizeof(int));
-    *port = 1100;
-    pthread_create(&udp_echo_th, NULL, udp_echo, port);
-
-    int did_tcp = 0;
-
-    char buf[4096];
     while (true) {
-        errno = 0;
-        int count = read(fd, buf, 4096);
+        struct pkb *pk = new_pkb();
 
+        int count = read(fd, pk->buffer, ETH_MTU);
         if (count <= 0) {
-            printf("Error reading interface (%s)\n", strerror(errno));
-            exit(0);
+            perror("read interface");
         }
 
-        /*
-        printf("\n");
-        printf("Read this from the socket:\n");
-        for (int i=0; i<count; i++) {
-            printf("%02hhx ", buf[i]);
-        }
-        printf("\n");
-        */
+        pk->from = &interfaces[0];
+        pk->length = count;
 
-        process_ethernet(fd, buf);
+        process_ethernet(pk);
 
-        if (mac_eq(gateway_mac, zero_mac) == 0) {
-            struct eth_hdr *req = malloc(ETH_MTU);
-            size_t len = make_ip_arp_req(req, "10.50.1.2", "10.50.1.1");
-            write_to_wire(fd, req, len);
-            free(req);
-        }
-        if (mac_eq(gateway_mac, zero_mac) != 0 && !did_tcp) {
-            did_tcp = true;
-            pthread_create(&tcp_out_th, NULL, tcp_out, port);
-        }
-
-        memset(buf, 0, count);
+        free_pkb(pk);
     }
 
-    void *res;
-    pthread_join(udp_echo_th, &res);
-    printf("%p\n", res);
 }
 

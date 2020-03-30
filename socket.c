@@ -49,7 +49,7 @@ struct socket_impl {
     int type;
     int protocol;
 
-    int ip_id;
+    unsigned int ip_id;
 
     // IPism
     // NETWORK byte order
