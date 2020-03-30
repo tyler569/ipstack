@@ -19,6 +19,8 @@
 #include "list.h"
 // #include "socket.h"
 
+void print_mac_address(struct mac_address mac);
+
 const char *if_name = "tap0";
 
 #define const_htons(x) (((x & 0xFF00) >> 8) | ((x & 0x00FF) << 8))
@@ -30,7 +32,7 @@ const char *if_name = "tap0";
 
 
 bool mac_eq(struct mac_address a, struct mac_address b) {
-    return memcmp(&a, &b, 6);
+    return memcmp(&a, &b, 6) == 0;
 }
 
 const struct mac_address broadcast_mac = {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
@@ -62,11 +64,11 @@ struct route {
 struct route route_table[1];
 
 be32 best_route(be32 address) {
-    int best_prefix = -1;
-    int best_next_hop = 0;
+    unsigned long best_prefix = 0;
+    be32 best_next_hop = 0;
     for (int i=0; i<ARRAY_LEN(route_table); i++) {
         if ((address & route_table[i].netmask) == route_table[i].prefix) {
-            if (route_table[i].prefix > best_prefix) {
+            if (route_table[i].prefix >= best_prefix) {
                 best_next_hop = route_table[i].next_hop;
                 best_prefix = route_table[i].prefix;
             }
@@ -143,19 +145,19 @@ struct ethernet_header *ethernet(struct pkb *pk) {
 }
 
 struct arp_header *arp(struct pkb *pk) {
-    return (struct arp_header *)&pk->buffer + sizeof(struct ethernet_header);
+    return (struct arp_header *)(pk->buffer + sizeof(struct ethernet_header));
 }
 
 struct ip4_header *ip4(struct pkb *pk) {
-    return (struct ip4_header *)&pk->buffer + sizeof(struct ethernet_header);
+    return (struct ip4_header *)(pk->buffer + sizeof(struct ethernet_header));
 }
 
 struct udp_header *udp(struct ip4_header *ip4) {
-    return (struct udp_header *)((char *)ip4 + (ip4->header_length * 32));
+    return (struct udp_header *)((char *)ip4 + (ip4->header_length * 4));
 }
 
 struct icmp_header *icmp(struct ip4_header *ip4) {
-    return (struct icmp_header *)((char *)ip4 + (ip4->header_length * 32));
+    return (struct icmp_header *)((char *)ip4 + (ip4->header_length * 4));
 }
 
 long ip_len(struct pkb *pk) {
@@ -165,7 +167,7 @@ long ip_len(struct pkb *pk) {
     }
 
     struct ip4_header *ip = ip4(pk);
-    return ip->total_length + sizeof(struct ethernet_header);
+    return ntohs(ip->total_length) + sizeof(struct ethernet_header);
 }
 
 
@@ -191,7 +193,7 @@ void echo_icmp(struct pkb *pk) {
 
 void reply_icmp(struct pkb *resp, struct pkb *pk) {
     struct ethernet_header *r_eth = ethernet(resp);
-    r_eth->ethertype = htons(ETH_ARP);
+    r_eth->ethertype = htons(ETH_IP);
 
     struct ip4_header *r_ip4 = ip4(resp);
     struct ip4_header *s_ip4 = ip4(pk);
@@ -210,9 +212,9 @@ void reply_icmp(struct pkb *resp, struct pkb *pk) {
     struct icmp_header *r_icmp = icmp(r_ip4);
     struct icmp_header *s_icmp = icmp(s_ip4);
 
-    size_t icmp_data_len = htons(s_ip4->total_length) -
-                           sizeof(struct ip4_header) - 
-                           sizeof(struct icmp_header);
+    size_t icmp_data_length = htons(s_ip4->total_length) -
+                              sizeof(struct ip4_header) - 
+                              sizeof(struct icmp_header);
 
     r_icmp->type = ICMP_ECHO_RESP;
     r_icmp->code = 0;
@@ -222,12 +224,18 @@ void reply_icmp(struct pkb *resp, struct pkb *pk) {
     r_icmp->timestamp = s_icmp->timestamp;
     r_icmp->timestamp_low = s_icmp->timestamp_low;
 
-    memcpy(r_icmp->data, s_icmp->data, icmp_data_len);
+    memcpy(r_icmp->data, s_icmp->data, icmp_data_length);
+
+    r_ip4->total_length = htons(
+            sizeof(struct ip4_header) +
+            sizeof(struct icmp_header) +
+            icmp_data_length
+    );
+
+    resp->length = ip_len(resp);
 
     ip_checksum(resp);
     icmp_checksum(resp);
-
-    resp->length = ip_len(resp);
 }
 
 void make_udp(struct udp_sock *sock, struct pkb *pk, void *data, size_t len) {
@@ -239,7 +247,9 @@ void make_udp(struct udp_sock *sock, struct pkb *pk, void *data, size_t len) {
     r_ip4->version = 4;
     r_ip4->header_length = 5;
     r_ip4->dscp = 0;
-    r_ip4->total_length = sizeof(struct ip4_header) + sizeof(struct udp_header) + len;
+    r_ip4->total_length = htons(
+        sizeof(struct ip4_header) + sizeof(struct udp_header) + len
+    );
     r_ip4->id = sock->ip_id;
     r_ip4->flags_frag = htons(0x4000); // DNF - make this better
     r_ip4->ttl = 64;
@@ -272,12 +282,22 @@ void dispatch(struct pkb *pk) {
     be32 next_hop = best_route(ip->destination_ip);
 
     struct net_if *intf = interface_containing(next_hop);
+    if (!intf) {
+        printf("null interface is bad");
+        // there is no way to get to that next hop!
+    }
     if (next_hop == intf->ip) {
         // it was me all along!
     }
 
+    printf("next hop is %x\n", next_hop);
+
     struct mac_address d;
     d = arp_cache_get(intf, next_hop);
+
+    printf("next hop is at ");
+    print_mac_address(d);
+    printf("\n");
 
     if (!mac_eq(d, zero_mac)) {
         struct ethernet_header *eth = ethernet(pk);
@@ -577,7 +597,7 @@ void icmp_checksum(struct pkb *pk) {
     struct ip4_header *r_ip4 = ip4(pk);
     struct icmp_header *r_icmp = icmp(r_ip4);
 
-    size_t extra_len = r_ip4->total_length -
+    size_t extra_len = ntohs(r_ip4->total_length) -
                         sizeof(struct ip4_header) -
                         sizeof(struct icmp_header);
 
@@ -601,7 +621,7 @@ size_t linux_write_to_wire(struct net_if *intf, struct pkb *pk) {
     if (pk->length > 0) {
         len = pk->length;
     } else if ((ip = ip4(pk))) {
-        len = ip->total_length + sizeof(struct ethernet_header);
+        len = ntohs(ip->total_length) + sizeof(struct ethernet_header);
     } else {
         printf("length unknown for pkb!\n");
         return -1;
@@ -632,7 +652,7 @@ void arp_reply(struct pkb *resp, struct pkb *pk) {
     r_arp->proto = htons(0x0800);   // ip4
     r_arp->hw_size = 6;
     r_arp->proto_size = 4;
-    r_arp->op = htons(ARP_REQ);
+    r_arp->op = htons(ARP_RESP);
     r_arp->sender_mac = pk->from->mac_address;
     r_arp->sender_ip = pk->from->ip;
     r_arp->target_mac = s_arp->sender_mac;
@@ -647,7 +667,9 @@ void process_arp_packet(struct pkb *pk) {
     struct arp_header *a = arp(pk);
     arp_cache_put(pk->from, a->sender_ip, a->sender_mac);
 
-    if (a->op == htons(ARP_REQ) && a->target_ip == pk->from->ip) {
+    printf("arp: target is %#x\n", a->target_ip);
+
+    if (ntohs(a->op) == ARP_REQ && a->target_ip == pk->from->ip) {
         struct pkb *resp = new_pkb();
         arp_reply(resp, pk);
         pk->from->write_to_wire(pk->from, resp);
@@ -706,7 +728,8 @@ void process_ethernet(struct pkb *pk) {
 struct net_if interfaces[] = {
     {
         .mac_address = {{0x02, 0x00, 0x00, 0x12, 0x34, 0x56}},
-        .ip = 0xac1f0102,
+        // .ip = 0xac1f0102,
+        .ip = 0x02011fac,
         .netmask = 0xffffff00,
         .fd = -1,
         .arp_cache = {},
@@ -716,15 +739,21 @@ struct net_if interfaces[] = {
 };
 
 struct net_if *interface_containing(be32 ip) {
-    if (ip == interfaces[0].ip) {
+    /*
+    if ((ip & interfaces[0].netmask) == 
+        (interfaces[0].ip & interfaces[0].netmask)) {
+
         return &interfaces[0];
     } else {
         return NULL;
     }
+    */
+    return &interfaces[0];
 }
 
 struct route route_table[] = {
-    {0x00000000, 0x00000000, 0xac1f0101}, // 172.31.1.1
+    // {0x00000000, 0x00000000, 0xac1f0101}, // 172.31.1.1
+    {0, 0, 0x01011fac}, // 172.31.1.1
 };
 
 int main() {
