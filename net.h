@@ -50,7 +50,7 @@ enum ip_protocol_numbers {
     PROTO_UDP = 17, // IPPROTO_UDP
 };
 
-struct _packed ip4_header {
+struct _packed ip_header {
     // eth_hdr
     uint8_t header_length : 4;
     uint8_t version : 4;
