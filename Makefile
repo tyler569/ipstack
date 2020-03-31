@@ -1,14 +1,14 @@
 
 .PHONY: all
 
-SRC= net.c list.c socket.c
+SRC= net.c list.c socket.c i_udp_echo.c
 
 TARGET= net
 
 CFLAGS= -Wall -Wno-address-of-packed-member -g
 
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $^ -lpthread
 
 clean:
 	rm net

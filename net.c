@@ -144,7 +144,7 @@ void reply_icmp(struct pkb *resp, struct pkb *pk) {
 void make_udp(struct socket_impl *sock, struct pkb *pk,
         struct sockaddr_in *d_addr, const void *data, size_t len) {
     struct ethernet_header *r_eth = eth_hdr(pk);
-    r_eth->ethertype = htons(ETH_ARP);
+    r_eth->ethertype = htons(ETH_IP);
 
     struct ip_header *ip = ip_hdr(pk);
 
@@ -157,7 +157,7 @@ void make_udp(struct socket_impl *sock, struct pkb *pk,
     ip->id = sock->ip_id;
     ip->flags_frag = htons(0x4000); // DNF - make this better
     ip->ttl = 64;
-    ip->proto = IPPROTO_ICMP;
+    ip->proto = IPPROTO_UDP;
     ip->source_ip = sock->local_ip;
 
     if (d_addr) {
@@ -168,7 +168,7 @@ void make_udp(struct socket_impl *sock, struct pkb *pk,
 
     struct udp_header *udp = udp_hdr(ip);
 
-    udp->length = len;
+    udp->length = htons(len + sizeof(struct udp_header));
     udp->checksum = 0;
     udp->source_port = sock->local_port;
 
@@ -639,6 +639,7 @@ void process_ip_packet(struct pkb *pk) {
         echo_icmp(pk);
         break;
     case PROTO_UDP:
+        printf("udp\n");
         socket_dispatch_udp(pk);
         break;
     case PROTO_TCP:
@@ -710,6 +711,12 @@ int main() {
 
     interfaces[0].fd = fd;
 
+    pthread_t udp_echo_th;
+    int *port = malloc(sizeof(int));
+    *port = 1100;
+    void *udp_echo(void *);
+    pthread_create(&udp_echo_th, NULL, udp_echo, port);
+
     while (true) {
         struct pkb *pk = new_pk();
 
@@ -726,6 +733,5 @@ int main() {
 
         free_pk(pk);
     }
-
 }
 
