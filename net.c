@@ -17,49 +17,13 @@
 #include <pthread.h>
 #include "net.h"
 #include "list.h"
-// #include "socket.h"
-
-void print_mac_address(struct mac_address mac);
+#include "socket.h"
 
 const char *if_name = "tap0";
-
-#define const_htons(x) (((x & 0xFF00) >> 8) | ((x & 0x00FF) << 8))
-
-#define ETH_MTU 1536
-
-
-#define ARRAY_LEN(array) (sizeof(array) / sizeof(*(array)))
-
 
 bool mac_eq(struct mac_address a, struct mac_address b) {
     return memcmp(&a, &b, 6) == 0;
 }
-
-const struct mac_address broadcast_mac = {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
-const struct mac_address zero_mac = {{0, 0, 0, 0, 0, 0}};
-
-
-typedef uint32_t be32;
-typedef uint16_t be16;
-
-
-struct sock {
-};
-struct udp_sock {
-    struct sock sock;
-    int ip_id;
-    be32 source_ip;
-    be32 destination_ip;
-    be32 source_port;
-    be32 destination_port;
-};
-
-
-struct route {
-    be32 prefix;
-    be32 netmask;
-    be32 next_hop;
-};
 
 struct route route_table[1];
 
@@ -78,67 +42,16 @@ be32 best_route(be32 address) {
     return best_next_hop;
 }
 
-struct pkb;
-
-struct arp_cache_line {
-    be32 ip;
-    struct mac_address mac;
-};
-
-struct arp_cache {
-#define ARP_CACHE_LEN 32
-    struct arp_cache_line cl[ARP_CACHE_LEN];
-};
-
-
-struct net_if {
-    struct mac_address mac_address;
-    be32 ip;
-    be32 netmask;
-
-#if __linux__
-    int fd;
-#elif __ngk__
-    struct net_if *intf;
-#endif
-
-    struct arp_cache arp_cache;
-    struct list pending_mac_queries;
-
-    size_t (*write_to_wire)(struct net_if *, struct pkb *);
-};
-
-struct pkb {
-    uint8_t anno[32];
-    struct net_if *from;
-    long length; // -1 if unknown
-
-    char buffer[];
-};
-
-struct pkb *new_pkb() {
+struct pkb *new_pk() {
     struct pkb *new_pk = calloc(1, sizeof(struct pkb) + ETH_MTU);
     new_pk->length = -1;
     new_pk->from = NULL;
     return new_pk;
 }
 
-void free_pkb(struct pkb *pkb) {
+void free_pk(struct pkb *pkb) {
     free(pkb);
 }
-
-
-struct ethernet_header;
-struct arp_header;
-struct ip_header;
-struct icmp_header;
-struct udp_header;
-
-struct tcp_socket;
-struct udp_socket;
-struct icmp_socket; // ?
-struct ip_socket; // raw sockets?
-
 
 struct ethernet_header *eth_hdr(struct pkb *pk) {
     return (struct ethernet_header *)&pk->buffer;
@@ -156,6 +69,10 @@ struct udp_header *udp_hdr(struct ip_header *ip) {
     return (struct udp_header *)((char *)ip + (ip->header_length * 4));
 }
 
+struct tcp_header *tcp_hdr(struct ip_header *ip) {
+    return (struct tcp_header *)((char *)ip + (ip->header_length * 4));
+}
+
 struct icmp_header *icmp_hdr(struct ip_header *ip) {
     return (struct icmp_header *)((char *)ip + (ip->header_length * 4));
 }
@@ -170,25 +87,11 @@ long ip_len(struct pkb *pk) {
     return ntohs(ip->total_length) + sizeof(struct ethernet_header);
 }
 
-
-// below
-void reply_icmp(struct pkb *resp, struct pkb *pk);
-
-// below
-void ip_checksum(struct pkb *);
-void icmp_checksum(struct pkb *);
-
-// TODO
-void udp_checksum(struct pkb *);
-
-// below
-void dispatch(struct pkb *);
-
 void echo_icmp(struct pkb *pk) {
-    struct pkb *resp = new_pkb();
+    struct pkb *resp = new_pk();
     reply_icmp(resp, pk);
     dispatch(resp);
-    free_pkb(resp);
+    free_pk(resp);
 }
 
 void reply_icmp(struct pkb *resp, struct pkb *pk) {
@@ -238,7 +141,8 @@ void reply_icmp(struct pkb *resp, struct pkb *pk) {
     icmp_checksum(resp);
 }
 
-void make_udp(struct udp_sock *sock, struct pkb *pk, void *data, size_t len) {
+void make_udp(struct socket_impl *sock, struct pkb *pk,
+        struct sockaddr_in *d_addr, const void *data, size_t len) {
     struct ethernet_header *r_eth = eth_hdr(pk);
     r_eth->ethertype = htons(ETH_ARP);
 
@@ -254,15 +158,25 @@ void make_udp(struct udp_sock *sock, struct pkb *pk, void *data, size_t len) {
     ip->flags_frag = htons(0x4000); // DNF - make this better
     ip->ttl = 64;
     ip->proto = IPPROTO_ICMP;
-    ip->source_ip = sock->source_ip;
-    ip->destination_ip = sock->destination_ip;
+    ip->source_ip = sock->local_ip;
+
+    if (d_addr) {
+        ip->destination_ip = d_addr->sin_addr.s_addr;
+    } else {
+        ip->destination_ip = sock->remote_ip;
+    }
 
     struct udp_header *udp = udp_hdr(ip);
 
-    udp->source_port = sock->source_port;
-    udp->destination_port = sock->destination_port;
     udp->length = len;
     udp->checksum = 0;
+    udp->source_port = sock->local_port;
+
+    if (d_addr) {
+        udp->destination_port = d_addr->sin_port;
+    } else {
+        udp->destination_port = sock->remote_port;
+    }
 
     memcpy(udp->data, data, len);
 
@@ -270,12 +184,49 @@ void make_udp(struct udp_sock *sock, struct pkb *pk, void *data, size_t len) {
     udp_checksum(pk);
 }
 
-// below
-void query_for(struct net_if *intf, be32 address, struct pkb *pk);
-struct mac_address arp_cache_get(struct net_if *intf, be32 ip);
+void make_tcp(struct socket_impl *s, struct pkb *pk, int flags,
+        const void *data, size_t len) {
+    struct ethernet_header *eth = eth_hdr(pk);
+    eth->ethertype = htons(ETH_IP);
 
-// TODO
-struct net_if *interface_containing(be32 ip);
+    struct ip_header *ip = ip_hdr(pk);
+    ip->version = 4;
+    ip->header_length = 5;
+    ip->dscp = 0;
+    ip->id = s->ip_id;
+    ip->flags_frag = htons(0x4000); // DNF
+    ip->ttl = 64;
+    ip->proto = IPPROTO_TCP;
+    ip->source_ip = s->local_ip;
+    ip->destination_ip = s->remote_ip;
+
+    struct tcp_header *tcp = tcp_hdr(ip);
+    tcp->source_port = s->local_port;
+    tcp->destination_port = s->remote_port;
+    tcp->seq = htonl(s->send_seq);
+    tcp->ack = htonl(s->recv_seq);
+    tcp->offset = 5;
+    tcp->_reserved = 0;
+    tcp->_reserved2 = 0;
+    tcp->f_urg = ((flags & TCP_URG) > 0);
+    tcp->f_ack = ((flags & TCP_ACK) > 0);
+    tcp->f_psh = ((flags & TCP_PSH) > 0);
+    tcp->f_rst = ((flags & TCP_RST) > 0);
+    tcp->f_syn = ((flags & TCP_SYN) > 0);
+    tcp->f_fin = ((flags & TCP_FIN) > 0);
+    tcp->window = htons(0x1000);
+    tcp->checksum = 0;
+    tcp->urg_ptr = 0;
+
+    ip->total_length = sizeof(struct ip_header) +
+                       sizeof(struct tcp_header) +
+                       len;
+
+    memcpy(tcp->data, data, len);
+
+    tcp_checksum(pk);
+    ip_checksum(pk);
+}
 
 void dispatch(struct pkb *pk) {
     struct ip_header *ip = ip_hdr(pk);
@@ -311,16 +262,6 @@ void dispatch(struct pkb *pk) {
     }
 }
 
-struct pending_mac_query {
-    be32 ip;
-    struct mac_address mac;
-
-    int attempts;
-
-    struct list pending_pks;
-};
-
-
 void arp_cache_put(struct net_if *intf, be32 ip, struct mac_address mac) {
     struct arp_cache *ac = &intf->arp_cache;
 
@@ -355,9 +296,6 @@ struct mac_address arp_cache_get(struct net_if *intf, be32 ip) {
     return zero_mac;
 }
 
-// below
-void arp_query(struct pkb *pk, be32 address, struct net_if *intf);
-
 void query_for(struct net_if *intf, be32 address, struct pkb *pk) {
     struct list_n *node = intf->pending_mac_queries.head;
 
@@ -385,7 +323,7 @@ void query_for(struct net_if *intf, be32 address, struct pkb *pk) {
     list_append(&q->pending_pks, pk);
     list_append(&intf->pending_mac_queries, q);
 
-    struct pkb *arp_hdr = new_pkb();
+    struct pkb *arp_hdr = new_pk();
     arp_query(arp_hdr, address, intf);
     intf->write_to_wire(intf, arp_hdr);
 }
@@ -540,6 +478,14 @@ void ip_checksum(struct pkb *pk) {
     ip->header_checksum = ~checksum;
 }
 
+struct udp_pseudoheader {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint8_t _zero;
+    uint8_t protocol;
+    int16_t udp_length;
+};
+
 void udp_checksum(struct pkb *pk) {
     struct ip_header *ip = ip_hdr(pk);
     struct udp_header *u = udp_hdr(ip);
@@ -548,7 +494,6 @@ void udp_checksum(struct pkb *pk) {
     u->checksum = 0;
 }
 
-/*
 struct tcp_pseudoheader {
     uint32_t src_ip;
     uint32_t dst_ip;
@@ -557,7 +502,9 @@ struct tcp_pseudoheader {
     uint16_t tcp_length;
 };
 
-void place_tcp_checksum(struct ip_hdr *ip) {
+void tcp_checksum(struct pkb *pk) {
+    printf("called unimplemented tcp_checksum()\n");
+    /*
     struct tcp_pkt *tcp = (void *)(ip + 1);
 
     int length = ntohs(ip->total_length);
@@ -591,8 +538,8 @@ void place_tcp_checksum(struct ip_hdr *ip) {
         sum = (sum & 0xFFFF) + (sum >> 16);
 
     tcp->checksum = ~(uint16_t)sum;
+    */
 }   
-*/
 
 void icmp_checksum(struct pkb *pk) {
     struct ip_header *ip = ip_hdr(pk);
@@ -671,10 +618,10 @@ void process_arp_packet(struct pkb *pk) {
     printf("arp: target is %#x\n", arp->target_ip);
 
     if (ntohs(arp->op) == ARP_REQ && arp->target_ip == pk->from->ip) {
-        struct pkb *resp = new_pkb();
+        struct pkb *resp = new_pk();
         arp_reply(resp, pk);
         pk->from->write_to_wire(pk->from, resp);
-        free_pkb(resp);
+        free_pk(resp);
     }
 }
 
@@ -692,10 +639,10 @@ void process_ip_packet(struct pkb *pk) {
         echo_icmp(pk);
         break;
     case PROTO_UDP:
-        // socket_dispatch_udp(pk);
+        socket_dispatch_udp(pk);
         break;
     case PROTO_TCP:
-        // socket_dispatch_tcp(pk);
+        socket_dispatch_tcp(pk);
         break;
     default:
         printf("Unknown IP protocol %i\n", ip->proto);
@@ -764,7 +711,7 @@ int main() {
     interfaces[0].fd = fd;
 
     while (true) {
-        struct pkb *pk = new_pkb();
+        struct pkb *pk = new_pk();
 
         int count = read(fd, pk->buffer, ETH_MTU);
         if (count <= 0) {
@@ -777,7 +724,7 @@ int main() {
 
         process_ethernet(pk);
 
-        free_pkb(pk);
+        free_pk(pk);
     }
 
 }
