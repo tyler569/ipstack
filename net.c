@@ -320,7 +320,7 @@ void arp_cache_put(struct net_if *intf, be32 ip, struct mac_address mac) {
         struct pending_mac_query *q = node->v;
 
         if (q->ip == ip) {
-            list_remove(&intf->pending_mac_queries, node);
+            list_remove_node(&intf->pending_mac_queries, node);
 
             struct pkb *pending_pk;
 
