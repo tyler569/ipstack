@@ -216,6 +216,11 @@ void make_tcp(struct socket_impl *s, struct pkb *pk, int flags,
     ip->proto = IPPROTO_TCP;
     ip->source_ip = s->local_ip;
     ip->destination_ip = s->remote_ip;
+    ip->total_length = htons(
+            sizeof(struct ip_header) +
+            sizeof(struct tcp_header) +
+            len
+    );
 
     struct tcp_header *tcp = tcp_hdr(ip);
     tcp->source_port = s->local_port;
@@ -234,10 +239,6 @@ void make_tcp(struct socket_impl *s, struct pkb *pk, int flags,
     tcp->window = htons(0x1000);
     tcp->checksum = 0;
     tcp->urg_ptr = 0;
-
-    ip->total_length = sizeof(struct ip_header) +
-                       sizeof(struct tcp_header) +
-                       len;
 
     memcpy(tcp->data, data, len);
 
@@ -319,8 +320,17 @@ void arp_cache_put(struct net_if *intf, be32 ip, struct mac_address mac) {
         struct pending_mac_query *q = node->v;
 
         if (q->ip == ip) {
-            // TODO
-            // allow the packets out with the new MAC as destination
+            list_remove(&intf->pending_mac_queries, node);
+
+            struct pkb *pending_pk;
+
+            struct list_n *pending_node = q->pending_pks.head;
+            while (pending_node) {
+                pending_pk = pending_node->v;
+                dispatch(pending_pk);
+                pending_node = pending_node->next;
+            }
+
             break;
         }
     }
