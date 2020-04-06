@@ -31,7 +31,7 @@ void *tcp_out(void *arg) {
 
     struct sockaddr_in bind_addr = {
         .sin_family = AF_INET,
-        .sin_addr = {0x0201320a}, // 10.50.1.2 TODO 0 binds
+        .sin_addr = {0x00000000},
         .sin_port = htons(my_port),
     };
 
@@ -40,7 +40,7 @@ void *tcp_out(void *arg) {
 
     struct sockaddr_in connect_addr = {
         .sin_family = AF_INET,
-        .sin_addr = {0x0101320a}, // 10.50.1.1
+        .sin_addr = {0x01011fac}, // 172.31.1.1
         .sin_port = htons(port),
     };
 
