@@ -479,8 +479,8 @@ void ip_checksum(struct pkb *pk) {
 }
 
 struct udp_pseudoheader {
-    uint32_t src_ip;
-    uint32_t dst_ip;
+    uint32_t source_ip;
+    uint32_t destination_ip;
     uint8_t _zero;
     uint8_t protocol;
     int16_t udp_length;
@@ -488,33 +488,17 @@ struct udp_pseudoheader {
 
 void udp_checksum(struct pkb *pk) {
     struct ip_header *ip = ip_hdr(pk);
-    struct udp_header *u = udp_hdr(ip);
-
-    // TODO actually calculate udp_hdr checksums
-    u->checksum = 0;
-}
-
-struct tcp_pseudoheader {
-    uint32_t src_ip;
-    uint32_t dst_ip;
-    uint8_t _zero;
-    uint8_t protocol;
-    uint16_t tcp_length;
-};
-
-void tcp_checksum(struct pkb *pk) {
-    printf("called unimplemented tcp_checksum()\n");
-    /*
-    struct tcp_pkt *tcp = (void *)(ip + 1);
+    struct udp_header *udp = udp_hdr(ip);
 
     int length = ntohs(ip->total_length);
+    int n_bytes = length - sizeof(struct ip_header);
 
-    struct tcp_pseudoheader t = {
-        ip->src_ip,
-        ip->dst_ip,
+    struct udp_pseudoheader t = {
+        ip->source_ip,
+        ip->destination_ip,
         0,
-        PROTO_TCP,
-        htons(length - sizeof(struct ip_hdr)),
+        PROTO_UDP,
+        htons(n_bytes),
     };
 
     uint32_t sum = 0;
@@ -523,7 +507,51 @@ void tcp_checksum(struct pkb *pk) {
         sum += c[i];
     }
 
-    int n_bytes = length - sizeof(struct ip_hdr);
+    c = (uint16_t *)udp;
+    for (int i=0; i<n_bytes/2; i++) {
+        sum += c[i];
+    }
+
+    if (n_bytes % 2 != 0) {
+        uint16_t last = ((uint8_t *)ip)[length-1];
+        sum += last;
+    }
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
+    udp->checksum = ~(uint16_t)sum;
+}
+
+struct tcp_pseudoheader {
+    uint32_t source_ip;
+    uint32_t destination_ip;
+    uint8_t _zero;
+    uint8_t protocol;
+    uint16_t tcp_length;
+};
+
+void tcp_checksum(struct pkb *pk) {
+    struct ip_header *ip = ip_hdr(pk);
+    struct tcp_header *tcp = tcp_hdr(ip);
+
+    int length = ntohs(ip->total_length);
+    int n_bytes = length - sizeof(struct ip_header);
+
+    struct tcp_pseudoheader t = {
+        ip->source_ip,
+        ip->destination_ip,
+        0,
+        PROTO_TCP,
+        htons(n_bytes),
+    };
+
+    uint32_t sum = 0;
+    uint16_t *c = (uint16_t *)&t;
+    for (int i=0; i<sizeof(t)/2; i++) {
+        sum += c[i];
+    }
+
     c = (uint16_t *)tcp;
     for (int i=0; i<n_bytes/2; i++) {
         sum += c[i];
@@ -538,7 +566,6 @@ void tcp_checksum(struct pkb *pk) {
         sum = (sum & 0xFFFF) + (sum >> 16);
 
     tcp->checksum = ~(uint16_t)sum;
-    */
 }   
 
 void icmp_checksum(struct pkb *pk) {
@@ -639,7 +666,6 @@ void process_ip_packet(struct pkb *pk) {
         echo_icmp(pk);
         break;
     case PROTO_UDP:
-        printf("udp\n");
         socket_dispatch_udp(pk);
         break;
     case PROTO_TCP:
@@ -712,10 +738,16 @@ int main() {
     interfaces[0].fd = fd;
 
     pthread_t udp_echo_th;
-    int *port = malloc(sizeof(int));
-    *port = 1100;
+    int *uport = malloc(sizeof(int));
+    *uport = 1100;
     void *udp_echo(void *);
-    pthread_create(&udp_echo_th, NULL, udp_echo, port);
+    pthread_create(&udp_echo_th, NULL, udp_echo, uport);
+
+    pthread_t tcp_out_th;
+    int *tport = malloc(sizeof(int));
+    *tport = 1101;
+    void *tcp_out(void *);
+    pthread_create(&tcp_out_th, NULL, tcp_out, tport);
 
     while (true) {
         struct pkb *pk = new_pk();

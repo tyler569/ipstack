@@ -1,7 +1,7 @@
 
 .PHONY: all
 
-SRC= net.c list.c socket.c i_udp_echo.c
+SRC= net.c list.c socket.c i_udp_echo.c i_tcp_out.c
 
 TARGET= net
 
