@@ -58,22 +58,39 @@ struct ethernet_header *eth_hdr(struct pkb *pk) {
 }
 
 struct arp_header *arp_hdr(struct pkb *pk) {
+    struct ethernet_header *eth = eth_hdr(pk);
+    if (ntohs(eth->ethertype) != ETH_ARP) {
+        return NULL;
+    }
     return (struct arp_header *)(pk->buffer + sizeof(struct ethernet_header));
 }
 
 struct ip_header *ip_hdr(struct pkb *pk) {
+    struct ethernet_header *eth = eth_hdr(pk);
+    if (ntohs(eth->ethertype) != ETH_IP) {
+        return NULL;
+    }
     return (struct ip_header *)(pk->buffer + sizeof(struct ethernet_header));
 }
 
 struct udp_header *udp_hdr(struct ip_header *ip) {
+    if (ip->proto != PROTO_UDP) {
+        return NULL;
+    }
     return (struct udp_header *)((char *)ip + (ip->header_length * 4));
 }
 
 struct tcp_header *tcp_hdr(struct ip_header *ip) {
+    if (ip->proto != PROTO_TCP) {
+        return NULL;
+    }
     return (struct tcp_header *)((char *)ip + (ip->header_length * 4));
 }
 
 struct icmp_header *icmp_hdr(struct ip_header *ip) {
+    if (ip->proto != PROTO_ICMP) {
+        return NULL;
+    }
     return (struct icmp_header *)((char *)ip + (ip->header_length * 4));
 }
 
@@ -241,6 +258,31 @@ void dispatch(struct pkb *pk) {
         // it was me all along!
         printf("TODO: handle packets to own actual interface\n");
         return;
+    }
+
+    // enable bind to 0.0.0.0
+    if (ip && ip->source_ip == 0) {
+        ip->source_ip = intf->ip;
+
+        ip_checksum(pk);
+        
+        do {
+            struct udp_header *udp = udp_hdr(ip);
+            if (udp) {
+                udp_checksum(pk);
+                break;
+            }
+            struct tcp_header *tcp = tcp_hdr(ip);
+            if (tcp) {
+                tcp_checksum(pk);
+                break;
+            }
+            struct icmp_header *icmp = icmp_hdr(ip);
+            if (icmp) {
+                icmp_checksum(pk);
+                break;
+            }
+        } while (0);
     }
 
     printf("next hop is %x\n", next_hop);
