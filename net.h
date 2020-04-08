@@ -149,6 +149,7 @@ struct pkb {
     uint8_t anno[32];
     struct net_if *from;
     long length; // -1 if unknown
+    list_node queue;
 
     char buffer[];
 };
@@ -175,7 +176,9 @@ struct pending_mac_query {
 
     int attempts;
 
-    struct list pending_pks;
+    list pending_pks;
+
+    list_node queries; // net_if.pending_mac_queries
 };
 
 struct net_if {
@@ -190,7 +193,7 @@ struct net_if {
 #endif
 
     struct arp_cache arp_cache;
-    struct list pending_mac_queries;
+    list pending_mac_queries;
 
     size_t (*write_to_wire)(struct net_if *, struct pkb *);
 };

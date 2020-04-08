@@ -177,7 +177,7 @@ void make_udp(struct socket_impl *sock, struct pkb *pk,
     ip->total_length = htons(
         sizeof(struct ip_header) + sizeof(struct udp_header) + len
     );
-    ip->id = sock->ip_id;
+    ip->id = ntohs(sock->ip_id);
     ip->flags_frag = htons(0x4000); // DNF - make this better
     ip->ttl = 64;
     ip->proto = IPPROTO_UDP;
@@ -216,7 +216,7 @@ void make_tcp(struct socket_impl *s, struct pkb *pk, int flags,
     ip->version = 4;
     ip->header_length = 5;
     ip->dscp = 0;
-    ip->id = s->ip_id;
+    ip->id = ntohs(s->ip_id);
     ip->flags_frag = htons(0x4000); // DNF
     ip->ttl = 64;
     ip->proto = IPPROTO_TCP;
@@ -232,7 +232,11 @@ void make_tcp(struct socket_impl *s, struct pkb *pk, int flags,
     tcp->source_port = s->local_port;
     tcp->destination_port = s->remote_port;
     tcp->seq = htonl(s->send_seq);
-    tcp->ack = htonl(s->recv_seq);
+    if (flags & TCP_ACK) {
+        tcp->ack = htonl(s->recv_seq);
+    } else {
+        tcp->ack = 0;
+    }
     tcp->offset = 5;
     tcp->_reserved = 0;
     tcp->_reserved2 = 0;
@@ -270,11 +274,10 @@ void dispatch(struct pkb *pk) {
     }
 
     // enable bind to 0.0.0.0
+    // This does not work yet - the checksums are wrong
     if (ip->source_ip == 0) {
         ip->source_ip = intf->ip;
 
-        ip_checksum(pk);
-        
         if (is_udp(pk)) {
             udp_checksum(pk);
         }
@@ -284,6 +287,8 @@ void dispatch(struct pkb *pk) {
         if (is_icmp(pk)) {
             icmp_checksum(pk);
         }
+
+        ip_checksum(pk);
     }
 
     printf("next hop is %x\n", next_hop);
@@ -315,20 +320,16 @@ void arp_cache_put(struct net_if *intf, be32 ip, struct mac_address mac) {
         }
     }
 
-    struct list_n *node = intf->pending_mac_queries.head;
-    while (node) {
-        struct pending_mac_query *q = node->v;
-
+    struct pending_mac_query *q;
+    list_foreach(&intf->pending_mac_queries, q, queries) {
         if (q->ip == ip) {
-            list_remove_node(&intf->pending_mac_queries, node);
+            // This might not be safe if I continued iterating (not sure),
+            // but is probably fine because I break if I ever get here
+            list_remove(&q->queries);
 
             struct pkb *pending_pk;
-
-            struct list_n *pending_node = q->pending_pks.head;
-            while (pending_node) {
-                pending_pk = pending_node->v;
+            list_foreach(&q->pending_pks, pending_pk, queue) {
                 dispatch(pending_pk);
-                pending_node = pending_node->next;
             }
 
             break;
@@ -349,31 +350,28 @@ struct mac_address arp_cache_get(struct net_if *intf, be32 ip) {
 }
 
 void query_for(struct net_if *intf, be32 address, struct pkb *pk) {
-    struct list_n *node = intf->pending_mac_queries.head;
-
-    while (node) {
-        struct pending_mac_query *q = node->v;
+    struct pending_mac_query *q;
+    list_foreach(&intf->pending_mac_queries, q, queries) {
         if (address == q->ip) {
             if (pk) {
-                list_append(&q->pending_pks, pk);
+                list_append(&q->pending_pks, pk, queue);
             }
             return;
         }
-        node = node->next;
     }
 
     // The query has not been sent
 
-    struct pending_mac_query *q = malloc(sizeof(*q));
+    q = malloc(sizeof(*q));
 
     q->ip = address;
     q->mac = zero_mac;
     q->attempts = 1;
-    q->pending_pks.head = NULL;
-    q->pending_pks.tail = NULL;
 
-    list_append(&q->pending_pks, pk);
-    list_append(&intf->pending_mac_queries, q);
+    list_init(&q->pending_pks);
+
+    list_append(&q->pending_pks, pk, queue);
+    list_append(&intf->pending_mac_queries, q, queries);
 
     struct pkb *arp_hdr = new_pk();
     arp_query(arp_hdr, address, intf);
@@ -780,14 +778,13 @@ struct route route_table[] = {
 };
 
 int main() {
-    init_global_lists();
-
     int fd = tun_alloc(if_name);
     if (fd < 0) {
         perror("tun_alloc");
     }
 
     interfaces[0].fd = fd;
+    list_init(&interfaces[0].pending_mac_queries);
 
     pthread_t udp_echo_th;
     int *uport = malloc(sizeof(int));

@@ -409,9 +409,26 @@ void tcp_ack(struct socket_impl *s) {
     free_pk(pk);
 }
 
+void tcp_fin_ack(struct socket_impl *s) {
+    enum tcp_flags flags = TCP_FIN | TCP_ACK;
+
+    struct pkb *pk = new_pk();
+    make_tcp(s, pk, flags, NULL, 0);
+    dispatch(pk);
+
+    struct ip_header *ip = ip_hdr(pk);
+    struct tcp_header *tcp = tcp_hdr(ip);
+
+    s->ip_id += 1;
+    if (tcp->f_syn || tcp->f_fin) {
+        s->send_seq += 1;
+    }
+    free_pk(pk);
+}
+
 void tcp_send(struct socket_impl *s, const void *data, size_t len) {
     struct pkb *pk = new_pk();
-    make_tcp(s, pk, TCP_NONE, data, len);
+    make_tcp(s, pk, TCP_PSH, data, len);
     dispatch(pk);
     free_pk(pk);
 
@@ -471,7 +488,7 @@ void socket_dispatch_tcp(struct pkb *pk) {
         s->send_ack = tcp_rack;
     }
 
-    // SYN -> RST
+    // RST -> close
     if (s->tcp_state == TCP_S_SYN_SENT && tcp->f_rst) {
         s->tcp_state = TCP_S_CLOSED;
         pthread_mutex_lock(&s->ack_mtx);
@@ -479,13 +496,25 @@ void socket_dispatch_tcp(struct pkb *pk) {
         pthread_mutex_unlock(&s->ack_mtx);
     }
 
-    // SYN -> SYN/ACK
+    // SYN/ACK -> Established
     if (s->tcp_state == TCP_S_SYN_SENT && tcp->f_syn && tcp->f_ack) {
         require_that(s->send_ack == s->send_seq);
         s->recv_seq = tcp_rseq + 1; // SYN is ~ 1 byte
         tcp_ack(s);
 
         s->tcp_state = TCP_S_ESTABLISHED;
+
+        pthread_mutex_lock(&s->ack_mtx);
+        pthread_cond_signal(&s->ack_cond);
+        pthread_mutex_unlock(&s->ack_mtx);
+    }
+
+    // FIN -> FIN/ACK
+    if (s->tcp_state == TCP_S_ESTABLISHED && tcp->f_fin) {
+        s->recv_seq = tcp_rseq + 1; // FIN counts as a byte
+        tcp_fin_ack(s);
+
+        s->tcp_state = TCP_S_FIN_WAIT_2;
 
         pthread_mutex_lock(&s->ack_mtx);
         pthread_cond_signal(&s->ack_cond);
