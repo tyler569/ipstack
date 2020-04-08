@@ -103,11 +103,50 @@ int is_icmp(struct pkb *pk) {
     return is_ip(pk) && ip->proto == PROTO_ICMP;
 }
 
-long ip_len(struct pkb *pk) {
-    if (!is_ip(pk)) return 0;
+int ip_len(struct pkb *pk) {
+    if (!is_ip(pk)) return -1;
 
     struct ip_header *ip = ip_hdr(pk);
-    return ntohs(ip->total_length) + sizeof(struct ethernet_header);
+    return ntohs(ip->total_length);
+}
+
+int tcp_len(struct pkb *pk) {
+    if (!is_tcp(pk)) return -1;
+
+    struct ip_header *ip = ip_hdr(pk);
+    struct tcp_header *tcp = tcp_hdr(ip);
+
+    return ntohs(ip->total_length) -
+           ip->header_length * 4 -
+           tcp->offset * 4;
+}
+
+void *tcp_data(struct pkb *pk) {
+    if (!is_tcp(pk)) return NULL;
+
+    struct ip_header *ip = ip_hdr(pk);
+    struct tcp_header *tcp = tcp_hdr(ip);
+
+    return (char *)tcp + tcp->offset * 4;
+}
+
+int udp_len(struct pkb *pk) {
+    if (!is_udp(pk)) return -1;
+
+    struct ip_header *ip = ip_hdr(pk);
+
+    return ntohs(ip->total_length) -
+           sizeof(struct ip_header) -
+           sizeof(struct udp_header);
+}
+
+void *udp_data(struct pkb *pk) {
+    if (!is_udp(pk)) return NULL;
+
+    struct ip_header *ip = ip_hdr(pk);
+    struct udp_header *udp = udp_hdr(ip);
+
+    return udp->data;
 }
 
 void echo_icmp(struct pkb *pk) {
@@ -158,7 +197,7 @@ void reply_icmp(struct pkb *resp, struct pkb *pk) {
             icmp_data_length
     );
 
-    resp->length = ip_len(resp);
+    resp->length = ip_len(resp) + sizeof(struct ethernet_header);
 
     ip_checksum(resp);
     icmp_checksum(resp);
@@ -202,6 +241,8 @@ void make_udp(struct socket_impl *sock, struct pkb *pk,
     }
 
     memcpy(udp->data, data, len);
+
+    pk->length = ip_len(pk) + sizeof(struct ethernet_header);
 
     ip_checksum(pk);
     udp_checksum(pk);
@@ -252,6 +293,8 @@ void make_tcp(struct socket_impl *s, struct pkb *pk, int flags,
 
     memcpy(tcp->data, data, len);
 
+    pk->length = ip_len(pk) + sizeof(struct ethernet_header);
+
     tcp_checksum(pk);
     ip_checksum(pk);
 }
@@ -291,13 +334,13 @@ void dispatch(struct pkb *pk) {
         ip_checksum(pk);
     }
 
-    printf("next hop is %x\n", next_hop);
+    // printf("next hop is %x\n", next_hop);
 
     struct mac_address d = arp_cache_get(intf, next_hop);
 
-    printf("next hop is at ");
-    print_mac_address(d);
-    printf("\n");
+    // printf("next hop is at ");
+    // print_mac_address(d);
+    // printf("\n");
 
     if (!mac_eq(d, zero_mac)) {
         struct ethernet_header *eth = eth_hdr(pk);
@@ -652,15 +695,15 @@ size_t linux_write_to_wire(struct net_if *intf, struct pkb *pk) {
         return -1;
     }
 
-    printf("Sending this:\n");
-    for (int i=0; i<len; i++) {
-        printf("%02hhx ", ((uint8_t *)buf)[i]);
-    }
-    printf("\n");
+    // printf("Sending this:\n");
+    // for (int i=0; i<len; i++) {
+    //     printf("%02hhx ", ((uint8_t *)buf)[i]);
+    // }
+    // printf("\n");
 
     size_t written_len = write(fd, buf, len);
 
-    printf("Wrote %li (%s)\n", len, strerror(errno));
+    // printf("Wrote %li (%s)\n", len, strerror(errno));
     return written_len;
 }
 
@@ -688,11 +731,11 @@ void arp_reply(struct pkb *resp, struct pkb *pk) {
 }
 
 void process_arp_packet(struct pkb *pk) {
-    print_arp_pkt(pk);
+    // print_arp_pkt(pk);
     struct arp_header *arp = arp_hdr(pk);
     arp_cache_put(pk->from, arp->sender_ip, arp->sender_mac);
 
-    printf("arp: target is %#x\n", arp->target_ip);
+    // printf("arp: target is %#x\n", arp->target_ip);
 
     if (ntohs(arp->op) == ARP_REQ && arp->target_ip == pk->from->ip) {
         struct pkb *resp = new_pk();
@@ -705,9 +748,9 @@ void process_arp_packet(struct pkb *pk) {
 void process_ip_packet(struct pkb *pk) {
     struct ip_header *ip = ip_hdr(pk);
 
-    printf("IP detected, next type %#02hhx\n", ip->proto);
+    // printf("IP detected, next type %#02hhx\n", ip->proto);
     if (ip->destination_ip != pk->from->ip) {
-        printf("Not for my IP, ignoring\n");
+        // printf("Not for my IP, ignoring\n");
         return;
     }
     
@@ -722,7 +765,7 @@ void process_ip_packet(struct pkb *pk) {
         socket_dispatch_tcp(pk);
         break;
     default:
-        printf("Unknown IP protocol %i\n", ip->proto);
+        // printf("Unknown IP protocol %i\n", ip->proto);
         break;
     }
 }
@@ -733,7 +776,7 @@ void process_ethernet(struct pkb *pk) {
     struct mac_address my_mac = pk->from->mac_address;
 
     if (mac_eq(dst_mac, my_mac) != 0 && mac_eq(dst_mac, broadcast_mac) != 0) {
-        printf("Not for my MAC addr, ignoring\n");
+        // printf("Not for my MAC addr, ignoring\n");
         return;
     }
 
@@ -745,7 +788,7 @@ void process_ethernet(struct pkb *pk) {
         process_ip_packet(pk);
         break;
     default:
-        printf("Unknown ethertype %#06hx\n", ntohs(eth->ethertype));
+        // printf("Unknown ethertype %#06hx\n", ntohs(eth->ethertype));
         break;
     }
 }

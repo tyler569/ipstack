@@ -58,6 +58,9 @@ void *tcp_out(void *arg) {
         int len = i_recv(sock, buf, BUFLEN, 0);
         if (len < 0) error("i_recv");
 
+        buf[len] = 0;
+        printf("TCP recieved: '%s'\n", buf);
+
         res = i_send(sock, buf, len, 0);
         if (res < 0) error("i_send");
     }

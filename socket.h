@@ -31,14 +31,6 @@ enum tcp_state {
     TCP_S_CLOSED,
 };
 
-struct accept_data {
-    // IPism
-    be32 remote_ip;
-    uint16_t remote_port;
-    uint32_t remote_seq;
-};
-
-// consider a rename to "sock"
 struct socket_impl {
     bool valid;
     enum socket_state state;
@@ -47,40 +39,42 @@ struct socket_impl {
     int type;
     int protocol;
 
-    unsigned int ip_id;
+    pthread_mutex_t block_mtx;
+    pthread_cond_t block_cond;
 
-    // IPism
-    // NETWORK byte order
+    // IP {{
+    unsigned int ip_id;
     be32 local_ip;
     be16 local_port;
     be32 remote_ip;
     be16 remote_port;
+    // }}
 
-    pthread_mutex_t data_mtx;
-    pthread_cond_t data_cond;
-    void *pending_data;
-    int pending_data_len;
-    be32 pending_remote_ip;
-    be16 pending_remote_port;
-
-    pthread_mutex_t listen_mtx;
-    pthread_cond_t listen_cond;
-    struct accept_data accept_data;
+    // SOCK_DGRAM {{
+    list dgram_queue;  // datagram socket pks
+    // }}
 
     // TCP {{
-    // HOST byte order
-    uint32_t send_seq; // SND.NXT
-    uint32_t send_ack; // SND.UNA
-    uint32_t recv_seq; // RCV.NXT
+    list accept_queue; // accept() TCP_SYN pks
+
+    uint32_t send_seq; // SND.NXT // seq of next byte to send
+    uint32_t send_ack; // SND.UNA // seq of last byte sent acknowleged
+    uint32_t recv_seq; // RCV.NXT // seq of next byte to be recieved
     uint16_t window_size;
 
-    char *recv_buffer; // [window]
-    char *send_buffer; // for retx
-
-    pthread_mutex_t ack_mtx;
-    pthread_cond_t ack_cond;
-
     enum tcp_state tcp_state;
+
+#define TCP_RECV_BUF_LEN (64 * 1024)
+    uint32_t recv_buf_seq;
+    size_t recv_buf_len;
+    char *recv_buf;
+
+    bool tcp_psh;
+
+    // packets with seq > next expected seq.
+    list ooo_queue;
+    // packets that could be retransmitted if needed
+    list unacked_pks;
     // }}
 };
 

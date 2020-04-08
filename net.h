@@ -223,7 +223,12 @@ struct udp_header *udp_hdr(struct ip_header *ip);
 struct tcp_header *tcp_hdr(struct ip_header *ip);
 struct icmp_header *icmp_hdr(struct ip_header *ip);
 
-long ip_len(struct pkb *pk);
+int ip_len(struct pkb *pk);
+int tcp_len(struct pkb *pk);
+int udp_len(struct pkb *pk);
+
+void *tcp_data(struct pkb *pk);
+void *udp_data(struct pkb *pk);
 
 void ip_checksum(struct pkb *);
 void icmp_checksum(struct pkb *);

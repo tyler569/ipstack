@@ -9,6 +9,7 @@
 #include <netinet/ip.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <assert.h>
 #include <errno.h>
 #include "net.h"
 #include "socket.h"
@@ -17,6 +18,10 @@ void tcp_syn(struct socket_impl *);
 void tcp_ack(struct socket_impl *);
 void tcp_send(struct socket_impl *, const void *, size_t);
 // void tcp_connect(struct socket_impl *);
+
+int min(int a, int b) {
+    return a > b ? b : a;
+}
 
 #define N_MAXSOCKETS 256
 
@@ -55,6 +60,14 @@ int i_socket(int domain, int type, int protocol) {
     s->type = type;         // SOCK_STREAM, SOCK_DGRAM, or SOCK_RAW
     s->protocol = protocol; // IPPROTO_TCP, IPPROTO_UDP, or IP protocol #
     s->state = SOCKET_REQUESTED;
+
+    if (protocol == IPPROTO_TCP) {
+        s->recv_buf = malloc(TCP_RECV_BUF_LEN);
+    }
+
+    pthread_mutex_init(&s->block_mtx, NULL);
+    pthread_cond_init(&s->block_cond, NULL);
+
     return i;
 }
 
@@ -74,9 +87,6 @@ int i_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     s->local_ip = in_addr->sin_addr.s_addr;
     s->local_port = in_addr->sin_port;
 
-    pthread_mutex_init(&s->data_mtx, NULL);
-    pthread_cond_init(&s->data_cond, NULL);
-
     s->state = SOCKET_BOUND;
     return 0;
 
@@ -86,18 +96,6 @@ int i_listen(int sockfd, int backlog) {
     struct socket_impl *s = sockets + sockfd;
     if (!s->valid) {
         errno = ENOTSOCK;
-        return -1;
-    }
-
-    int res = pthread_mutex_init(&s->listen_mtx, NULL);
-    if (res != 0) {
-        errno = EFAULT;
-        return -1;
-    }
-
-    pthread_cond_init(&s->listen_cond, NULL);
-    if (res != 0) {
-        errno = EFAULT;
         return -1;
     }
 
@@ -117,8 +115,16 @@ int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
         return -1;
     }
 
-    pthread_mutex_lock(&s->listen_mtx);
-    pthread_cond_wait(&s->listen_cond, &s->listen_mtx);
+    pthread_mutex_lock(&s->block_mtx);
+    struct pkb *accept_pk;
+    do {
+        pthread_cond_wait(&s->block_cond, &s->block_mtx);
+    } while(!list_head_entry(struct pkb, &s->accept_queue, queue));
+
+    accept_pk = list_pop_front(struct pkb, &s->accept_queue, queue);
+    struct ip_header *accept_ip = ip_hdr(accept_pk);
+    struct tcp_header *accept_tcp = tcp_hdr(accept_ip);
+    assert(accept_tcp->f_syn && !accept_tcp->f_ack);
 
     int i = next_avail();
     if (i == -1) {
@@ -131,9 +137,9 @@ int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     memcpy(as, s, sizeof(struct socket_impl));
     as->state = SOCKET_OUTBOUND;
     as->tcp_state = TCP_S_SYN_RECIEVED;
-    as->remote_ip = as->accept_data.remote_ip;
-    as->remote_port = as->accept_data.remote_port;
-    as->recv_seq = as->accept_data.remote_seq;
+    as->remote_ip = accept_ip->source_ip;
+    as->remote_port = accept_tcp->source_port;
+    as->recv_seq = accept_tcp->seq;
 
     struct sockaddr_in in_addr = {
         .sin_family = AF_INET,
@@ -146,8 +152,35 @@ int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 
     tcp_ack(s);
 
-    pthread_mutex_unlock(&s->listen_mtx);
+    pthread_mutex_unlock(&s->block_mtx);
     return i;
+}
+
+int tcp_connect(struct socket_impl *s, const struct sockaddr_in *addr) {
+    s->remote_ip = addr->sin_addr.s_addr;
+    s->remote_port = addr->sin_port;
+    s->state = SOCKET_OUTBOUND;
+    s->tcp_state = TCP_S_SYN_SENT;
+
+    pthread_mutex_lock(&s->block_mtx);
+    tcp_syn(s);
+
+    do {
+        pthread_cond_wait(&s->block_cond, &s->block_mtx);
+    } while (s->tcp_state == TCP_S_SYN_SENT);
+
+    pthread_mutex_unlock(&s->block_mtx);
+
+    if (s->tcp_state == TCP_S_ESTABLISHED) {
+        return 0;
+    } else if (s->tcp_state == TCP_S_CLOSED) {
+        errno = ECONNREFUSED;
+        return -1;
+    } else {
+        printf("I'm not sure how we got to %i\n", s->tcp_state);
+        errno = 1005;
+        return -1;
+    }
 }
 
 int i_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
@@ -163,25 +196,12 @@ int i_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         return -1;
     }
 
-    s->remote_ip = in_addr->sin_addr.s_addr;
-    s->remote_port = in_addr->sin_port;
-    s->state = SOCKET_OUTBOUND;
-
-    if (s->protocol == IPPROTO_TCP) {
-        
-        pthread_mutex_lock(&s->ack_mtx);
-        tcp_syn(s); // + timeout
-
-        pthread_cond_wait(&s->ack_cond, &s->ack_mtx);
-        pthread_mutex_unlock(&s->ack_mtx);
-
-        if (s->tcp_state != TCP_S_ESTABLISHED) {
-            errno = ECONNREFUSED;
-            return -1;
-        }
+    if (s->protocol != IPPROTO_TCP) {
+        errno = EPROTO;
+        return -1;
     }
 
-    return 0;
+    return tcp_connect(s, in_addr);
 }
 
 void udp_send(struct socket_impl *s, const void *data, size_t len) {
@@ -254,14 +274,48 @@ ssize_t i_sendto(int sockfd, const void *buf, size_t len, int flags,
 }
 
 ssize_t i_recv(int sockfd, void *buf, size_t len, int flags) {
+    printf("I_RECV\n");
     struct socket_impl *s = sockets + sockfd;
     if (!s->valid) {
         errno = ENOTSOCK;
         return -1;
     }
 
-    errno = 1000;
-    return -1; // ETODO
+    if (len < 1500) {
+        printf("warning: small buffer size may loose data at this time\n");
+    }
+
+    size_t buf_ix = 0;
+
+    while (buf_ix < len) {
+        pthread_mutex_lock(&s->block_mtx);
+        pthread_cond_wait(&s->block_cond, &s->block_mtx);
+        pthread_mutex_unlock(&s->block_mtx);
+        printf("woke up\n");
+
+        size_t available = min(len - buf_ix, s->recv_buf_len);
+
+        printf("%i bytes usable\n");
+
+        if (available > 0) {
+            memcpy(buf + buf_ix, s->recv_buf, available);
+            buf_ix += available;
+
+            memmove(s->recv_buf, s->recv_buf + available, available);
+            s->recv_buf_seq += available;
+            s->recv_buf_len -= available;
+        }
+
+        if (s->tcp_psh) {
+            printf("psh\n");
+            s->tcp_psh = false;
+            break;
+        }
+    }
+
+    printf("return\n");
+
+    return buf_ix;
 }
 
 ssize_t i_recvfrom(int sockfd, void *buf, size_t len, int flags,
@@ -272,8 +326,17 @@ ssize_t i_recvfrom(int sockfd, void *buf, size_t len, int flags,
         return -1;
     }
 
-    pthread_mutex_lock(&s->data_mtx);
-    pthread_cond_wait(&s->data_cond, &s->data_mtx);
+    pthread_mutex_lock(&s->block_mtx);
+    struct pkb *recv_pk;
+    do {
+        pthread_cond_wait(&s->block_cond, &s->block_mtx);
+    } while (!list_head_entry(struct pkb, &s->dgram_queue, queue));
+
+    recv_pk = list_pop_front(struct pkb, &s->dgram_queue, queue);
+    struct ip_header *recv_ip = ip_hdr(recv_pk);
+    struct udp_header *recv_udp = udp_hdr(recv_ip);
+    int udp_data_len = udp_len(recv_pk);
+    void *udp_d = udp_data(recv_pk);
 
     struct sockaddr_in *in_addr = (struct sockaddr_in *)src_addr;
     if (*addrlen < sizeof(*in_addr)) {
@@ -281,17 +344,14 @@ ssize_t i_recvfrom(int sockfd, void *buf, size_t len, int flags,
         return -1;
     }
     in_addr->sin_family = AF_INET;
-    in_addr->sin_port = s->pending_remote_port;
-    in_addr->sin_addr.s_addr = s->pending_remote_ip;
+    in_addr->sin_port = recv_udp->source_port;
+    in_addr->sin_addr.s_addr = recv_ip->source_ip;
     *addrlen = sizeof(*in_addr);
 
-    len = (s->pending_data_len < len) ? s->pending_data_len : len;
-    memcpy(buf, s->pending_data, len);
+    len = (udp_data_len < len) ? udp_data_len : len;
+    memcpy(buf, udp_d, len);
 
-    free(s->pending_data);
-    s->pending_data = NULL;
-
-    pthread_mutex_unlock(&s->data_mtx);
+    pthread_mutex_unlock(&s->block_mtx);
     return len;
 }
 
@@ -314,7 +374,6 @@ void socket_dispatch_udp(struct pkb *pk) {
     printf("dispatching udp\n");
     struct ip_header *ip = ip_hdr(pk);
     struct udp_header *udp = udp_hdr(ip);
-    void *data = udp->data;
 
     int best_match = -1;
     for (int i=0; i<N_MAXSOCKETS; i++) {
@@ -353,25 +412,11 @@ void socket_dispatch_udp(struct pkb *pk) {
     printf("dispatch found match: %i\n", best_match);
     struct socket_impl *s = sockets + best_match;
 
-    if (s->pending_data) {
-        // too slow, drop. (TODO: queue)
-        return;
-    }
+    list_append(&s->dgram_queue, pk, queue);
 
-    int len = ntohs(udp->length) - 8;
-    s->pending_data = malloc(len);
-    s->pending_data_len = len;
-    s->pending_remote_ip = ip->source_ip;
-    s->pending_remote_port = udp->source_port;
-    memcpy(s->pending_data, data, len);
-
-    pthread_mutex_lock(&s->data_mtx);
-    pthread_cond_signal(&s->data_cond);
-    pthread_mutex_unlock(&s->data_mtx);
-}
-
-size_t tcp_len(struct tcp_header *tcp) {
-    return tcp->offset * 4;
+    pthread_mutex_lock(&s->block_mtx);
+    pthread_cond_signal(&s->block_cond);
+    pthread_mutex_unlock(&s->block_mtx);
 }
 
 void tcp_syn(struct socket_impl *s) {
@@ -479,7 +524,6 @@ void socket_dispatch_tcp(struct pkb *pk) {
     printf("dispatch found match: %i\n", best_match);
     struct socket_impl *s = sockets + best_match;
 
-    uint16_t ip_len = ntohs(ip->total_length);
     uint32_t tcp_rseq = ntohl(tcp->seq);
     uint32_t tcp_rack = ntohl(tcp->ack);
 
@@ -491,9 +535,9 @@ void socket_dispatch_tcp(struct pkb *pk) {
     // RST -> close
     if (s->tcp_state == TCP_S_SYN_SENT && tcp->f_rst) {
         s->tcp_state = TCP_S_CLOSED;
-        pthread_mutex_lock(&s->ack_mtx);
-        pthread_cond_signal(&s->ack_cond);
-        pthread_mutex_unlock(&s->ack_mtx);
+        pthread_mutex_lock(&s->block_mtx);
+        pthread_cond_signal(&s->block_cond);
+        pthread_mutex_unlock(&s->block_mtx);
     }
 
     // SYN/ACK -> Established
@@ -504,9 +548,9 @@ void socket_dispatch_tcp(struct pkb *pk) {
 
         s->tcp_state = TCP_S_ESTABLISHED;
 
-        pthread_mutex_lock(&s->ack_mtx);
-        pthread_cond_signal(&s->ack_cond);
-        pthread_mutex_unlock(&s->ack_mtx);
+        pthread_mutex_lock(&s->block_mtx);
+        pthread_cond_signal(&s->block_cond);
+        pthread_mutex_unlock(&s->block_mtx);
     }
 
     // FIN -> FIN/ACK
@@ -514,48 +558,78 @@ void socket_dispatch_tcp(struct pkb *pk) {
         s->recv_seq = tcp_rseq + 1; // FIN counts as a byte
         tcp_fin_ack(s);
 
-        s->tcp_state = TCP_S_FIN_WAIT_2;
+        s->tcp_state = TCP_S_CLOSE_WAIT;
 
-        pthread_mutex_lock(&s->ack_mtx);
-        pthread_cond_signal(&s->ack_cond);
-        pthread_mutex_unlock(&s->ack_mtx);
+        pthread_mutex_lock(&s->block_mtx);
+        pthread_cond_signal(&s->block_cond);
+        pthread_mutex_unlock(&s->block_mtx);
     }
 
-    uint32_t new_seq = tcp_rseq + ip_len - sizeof(struct ip_header) - tcp_len(tcp);
-    if (tcp->f_fin) {
-        new_seq += 1;
-    }
-
-    if (s->tcp_state == TCP_S_ESTABLISHED && new_seq > s->recv_seq) {
-        // TODO ^^ MODULO 2**32
+    if (s->tcp_state == TCP_S_CLOSING && tcp->f_ack) {
+        // do I know the ack is _for_ the FIN ?
         //
-        // TODO: save data
-        // TODO: ack data
-        // TODO: make available to application
-        printf("TCP: data available, just acking.\n");
-        s->recv_seq = new_seq;
-        tcp_ack(s);
+        // also is this CLOSING or LAST_ACK ?
+    }
+
+    uint32_t start_rseq = tcp_rseq;
+    uint32_t end_rseq = tcp_rseq + tcp_len(pk);
+
+    if (tcp->f_syn || tcp->f_fin) {
+        end_rseq += 1;
+    }
+
+    if (s->tcp_state == TCP_S_ESTABLISHED) {
+        // TODO ^^ MODULO 2**32
+
+        if (s->recv_seq == start_rseq) {
+            int tcp_length = tcp_len(pk);
+            if (tcp_length + s->recv_buf_len > TCP_RECV_BUF_LEN) {
+                // too slow!
+                // TODO: tcp_ooo_insert(ooo_queue)
+                //       s->pending_slow_data = true
+            } else {
+                void *tcp_d = tcp_data(pk);
+                memcpy(s->recv_buf + s->recv_buf_len, tcp_d, tcp_length);
+                s->recv_buf_len += tcp_length;
+
+                s->recv_seq = end_rseq;
+                tcp_ack(s);
+
+                /*
+                if (list_head_entry(&s->ooo_queue)) {
+                    // TODO: try to apply ooo data pending
+                }
+                */
+
+                // TODO: check if needs signal?
+                // not sure how this works tbh
+
+                if (tcp->f_psh) {
+                    // signal userspace should process ASAP
+                    s->tcp_psh = true;
+                }
+                pthread_mutex_lock(&s->block_mtx);
+                pthread_cond_signal(&s->block_cond);
+                pthread_mutex_unlock(&s->block_mtx);
+            }
+        }
     }
 
     // RST
     if (tcp->f_rst) {
         printf("TCP RST\n");
+        s->tcp_state = TCP_S_CLOSED;
         return;
     }
 
     if (s->state == SOCKET_LISTENING) {
-        s->accept_data.remote_ip = ip->source_ip;
-        s->accept_data.remote_port = tcp->source_port;
-        s->accept_data.remote_seq = tcp->seq;
+        list_append(&s->accept_queue, pk, queue);
 
-        pthread_mutex_lock(&s->listen_mtx);
-        pthread_cond_signal(&s->listen_cond);
-        pthread_mutex_unlock(&s->listen_mtx);
+        pthread_mutex_lock(&s->block_mtx);
+        pthread_cond_signal(&s->block_cond);
+        pthread_mutex_unlock(&s->block_mtx);
 
         // accept runs the syn/ack
     }
-
-    // segment things
-    // TODO
 }
 
