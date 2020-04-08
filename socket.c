@@ -253,7 +253,7 @@ ssize_t i_sendto(int sockfd, const void *buf, size_t len, int flags,
     return len; // what if we sent less?
 }
 
-ssize_t i_recv(int sockfd, void *bud, size_t len, int flags) {
+ssize_t i_recv(int sockfd, void *buf, size_t len, int flags) {
     struct socket_impl *s = sockets + sockfd;
     if (!s->valid) {
         errno = ENOTSOCK;
