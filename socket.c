@@ -428,7 +428,7 @@ void tcp_fin_ack(struct socket_impl *s) {
 
 void tcp_send(struct socket_impl *s, const void *data, size_t len) {
     struct pkb *pk = new_pk();
-    make_tcp(s, pk, TCP_PSH, data, len);
+    make_tcp(s, pk, TCP_PSH | TCP_ACK, data, len);
     dispatch(pk);
     free_pk(pk);
 
