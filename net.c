@@ -104,14 +104,14 @@ int is_icmp(struct pkb *pk) {
 }
 
 int ip_len(struct pkb *pk) {
-    if (!is_ip(pk)) return -1;
+    assert(is_ip(pk));
 
     struct ip_header *ip = ip_hdr(pk);
     return ntohs(ip->total_length);
 }
 
 int tcp_len(struct pkb *pk) {
-    if (!is_tcp(pk)) return -1;
+    assert(is_tcp(pk));
 
     struct ip_header *ip = ip_hdr(pk);
     struct tcp_header *tcp = tcp_hdr(ip);
@@ -122,7 +122,7 @@ int tcp_len(struct pkb *pk) {
 }
 
 void *tcp_data(struct pkb *pk) {
-    if (!is_tcp(pk)) return NULL;
+    assert(is_tcp(pk));
 
     struct ip_header *ip = ip_hdr(pk);
     struct tcp_header *tcp = tcp_hdr(ip);
@@ -131,7 +131,7 @@ void *tcp_data(struct pkb *pk) {
 }
 
 int udp_len(struct pkb *pk) {
-    if (!is_udp(pk)) return -1;
+    assert(is_udp(pk));
 
     struct ip_header *ip = ip_hdr(pk);
 
@@ -141,7 +141,7 @@ int udp_len(struct pkb *pk) {
 }
 
 void *udp_data(struct pkb *pk) {
-    if (!is_udp(pk)) return NULL;
+    assert(is_udp(pk));
 
     struct ip_header *ip = ip_hdr(pk);
     struct udp_header *udp = udp_hdr(ip);
