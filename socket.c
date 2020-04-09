@@ -281,21 +281,19 @@ ssize_t i_recv(int sockfd, void *buf, size_t len, int flags) {
         return -1;
     }
 
-    if (len < 1500) {
-        printf("warning: small buffer size may loose data at this time\n");
-    }
-
     size_t buf_ix = 0;
 
     while (buf_ix < len) {
         pthread_mutex_lock(&s->block_mtx);
         pthread_cond_wait(&s->block_cond, &s->block_mtx);
         pthread_mutex_unlock(&s->block_mtx);
-        printf("woke up\n");
+
+        if (s->tcp_state != TCP_S_ESTABLISHED) {
+            // done
+            return 0;
+        }
 
         size_t available = min(len - buf_ix, s->recv_buf_len);
-
-        printf("%i bytes usable\n");
 
         if (available > 0) {
             memcpy(buf + buf_ix, s->recv_buf, available);
@@ -307,13 +305,10 @@ ssize_t i_recv(int sockfd, void *buf, size_t len, int flags) {
         }
 
         if (s->tcp_psh) {
-            printf("psh\n");
             s->tcp_psh = false;
             break;
         }
     }
-
-    printf("return\n");
 
     return buf_ix;
 }
