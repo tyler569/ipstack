@@ -24,7 +24,7 @@ void *tcp_echo(void *arg) {
 
     struct sockaddr_in bind_addr = {
         .sin_family = AF_INET,
-        .sin_addr = {0},
+        .sin_addr = {0x02011fac},
         .sin_port = htons(port),
     };
 

@@ -14,10 +14,8 @@
 #include "net.h"
 #include "socket.h"
 
-void tcp_syn(struct socket_impl *);
-void tcp_ack(struct socket_impl *);
 void tcp_send(struct socket_impl *, const void *, size_t);
-// void tcp_connect(struct socket_impl *);
+void tcp_status(struct socket_impl *, enum tcp_flags);
 
 int min(int a, int b) {
     return a > b ? b : a;
@@ -140,16 +138,21 @@ int x_accept(struct socket_impl *s, struct sockaddr *addr, socklen_t *addrlen) {
     struct socket_impl *as = sockets + i;
 
     memcpy(as, s, sizeof(struct socket_impl));
+    pthread_mutex_init(&as->block_mtx, NULL);
 
     // list_init(&as->accept_queue);
     list_init(&as->ooo_queue);
     list_init(&as->unacked_pks);
-
+    
     as->state = SOCKET_OUTBOUND;
     as->tcp_state = TCP_S_SYN_RECIEVED;
     as->remote_ip = accept_ip->source_ip;
     as->remote_port = accept_tcp->source_port;
-    as->recv_seq = accept_tcp->seq;
+    as->recv_seq = ntohl(accept_tcp->seq);
+
+    if (as->local_ip == 0) {
+        as->local_ip = accept_pk->from->ip;
+    }
 
     struct sockaddr_in in_addr = {
         .sin_family = AF_INET,
@@ -160,7 +163,8 @@ int x_accept(struct socket_impl *s, struct sockaddr *addr, socklen_t *addrlen) {
     memcpy(addr, &in_addr, sizeof(in_addr));
     *addrlen = sizeof(in_addr);
 
-    tcp_ack(s);
+    as->recv_seq += 1;
+    tcp_status(as, TCP_SYN | TCP_ACK);
 
     pthread_mutex_unlock(&s->block_mtx);
     return i;
@@ -170,10 +174,14 @@ int tcp_connect(struct socket_impl *s, const struct sockaddr_in *addr) {
     s->remote_ip = addr->sin_addr.s_addr;
     s->remote_port = addr->sin_port;
     s->state = SOCKET_OUTBOUND;
-    s->tcp_state = TCP_S_SYN_SENT;
+
+    s->send_seq = rand();
+    s->send_ack = 0;
+    s->recv_seq = 0;
 
     pthread_mutex_lock(&s->block_mtx);
-    tcp_syn(s);
+    tcp_status(s, TCP_SYN);
+    s->tcp_state = TCP_S_SYN_SENT;
 
     do {
         pthread_cond_wait(&s->block_cond, &s->block_mtx);
@@ -432,39 +440,36 @@ void socket_dispatch_udp(struct pkb *pk) {
 
     int best_match = -1;
     for (int i=0; i<N_MAXSOCKETS; i++) {
-        int strength = 0;
         struct socket_impl *s = sockets + i;
+        bool outbound = s->state == SOCKET_OUTBOUND;
+        bool listening = s->state == SOCKET_LISTENING;
 
-        if (!(s->valid)) continue;
-        if (!(s->domain == AF_INET)) continue;
-        if (!(s->type == SOCK_DGRAM)) continue;
-        if (!(s->protocol == IPPROTO_UDP)) continue;
+        if (!s->valid) continue;
+        if (s->domain != AF_INET) continue;
+        if (s->type != SOCK_STREAM) continue;
+        if (s->protocol != IPPROTO_UDP) continue;
 
-        if (s->local_ip == ip->destination_ip) strength++;
-        if (s->local_port == udp->destination_port) strength++;
-
-        if (s->state == SOCKET_BOUND && s->local_ip == 0) strength++;
-
-        if (s->state == SOCKET_OUTBOUND) {
-            if (s->remote_ip == ip->source_ip) strength++;
-            if (s->remote_port == udp->source_port) strength++;
+        if (outbound) {
+            if (s->local_ip != ip->destination_ip) continue;
+        } else if (listening) {
+            if (s->local_ip != ip->destination_ip && s->local_ip != 0) continue;
         }
 
-        if (s->state == SOCKET_BOUND && strength == 2) {
-            best_match = i;
-            break;
-        }
+        if (s->local_port != udp->destination_port) continue;
 
-        if (s->state == SOCKET_OUTBOUND && strength == 4) {
-            best_match = i;
-            break;
+        if (outbound) {
+            if (s->remote_ip != ip->source_ip) continue;
+            if (s->remote_port != udp->source_port) continue;
         }
+        
+        best_match = i;
     }
     if (best_match == -1) {
         // no matching socket, drop.
+        printf("udp: no matching socket\n");
         return;
     }
-    printf("dispatch found match: %i\n", best_match);
+    printf("udp dispatch found match: %i\n", best_match);
     struct socket_impl *s = sockets + best_match;
 
     pk_incref(pk);
@@ -475,56 +480,21 @@ void socket_dispatch_udp(struct pkb *pk) {
     pthread_mutex_unlock(&s->block_mtx);
 }
 
-void tcp_syn(struct socket_impl *s) {
-    s->send_seq = rand();
-    s->send_ack = 0;
-    s->recv_seq = 0;
-
-    struct pkb *pk = new_pk();
-    make_tcp(s, pk, TCP_SYN, NULL, 0);
-    dispatch(pk);
-    free_pk(pk);
-
-    s->ip_id += 1;
-    s->send_seq += 1; // SYN is ~ 1 byte.
-    s->tcp_state = TCP_S_SYN_SENT;
-}
-
-void tcp_ack(struct socket_impl *s) {
-    enum tcp_flags flags = TCP_ACK;
-    if (s->tcp_state == TCP_S_LISTEN) {
-        flags |= TCP_SYN;
-    }
-
+void tcp_status(struct socket_impl *s, enum tcp_flags flags) {
     struct pkb *pk = new_pk();
     make_tcp(s, pk, flags, NULL, 0);
     dispatch(pk);
-
-    struct ip_header *ip = ip_hdr(pk);
-    struct tcp_header *tcp = tcp_hdr(ip);
+    free_pk(pk);
 
     s->ip_id += 1;
-    if (tcp->f_syn || tcp->f_fin) {
+
+    if (flags & TCP_SYN) {
         s->send_seq += 1;
     }
-    free_pk(pk);
-}
 
-void tcp_fin_ack(struct socket_impl *s) {
-    enum tcp_flags flags = TCP_FIN | TCP_ACK;
-
-    struct pkb *pk = new_pk();
-    make_tcp(s, pk, flags, NULL, 0);
-    dispatch(pk);
-
-    struct ip_header *ip = ip_hdr(pk);
-    struct tcp_header *tcp = tcp_hdr(ip);
-
-    s->ip_id += 1;
-    if (tcp->f_syn || tcp->f_fin) {
+    if (flags & TCP_FIN) {
         s->send_seq += 1;
     }
-    free_pk(pk);
 }
 
 void tcp_send(struct socket_impl *s, const void *data, size_t len) {
@@ -545,62 +515,80 @@ void socket_dispatch_tcp(struct pkb *pk) {
 
     int best_match = -1;
     for (int i=0; i<N_MAXSOCKETS; i++) {
-        int strength = 0;
         struct socket_impl *s = sockets + i;
+        bool outbound = s->state == SOCKET_OUTBOUND;
+        bool listening = s->state == SOCKET_LISTENING;
 
-        if (!(s->valid)) continue;
-        if (!(s->domain == AF_INET)) continue;
-        if (!(s->type == SOCK_STREAM)) continue;
-        if (!(s->protocol == IPPROTO_TCP)) continue;
+        if (!s->valid) continue;
+        if (s->domain != AF_INET) continue;
+        if (s->type != SOCK_STREAM) continue;
+        if (s->protocol != IPPROTO_TCP) continue;
 
-        if (s->local_ip == ip->destination_ip) strength++;
-        if (s->local_port == tcp->destination_port) strength++;
-
-        if (s->state == SOCKET_LISTENING && s->local_ip == 0) strength++;
-
-        if (s->state == SOCKET_OUTBOUND) {
-            if (s->remote_ip == ip->source_ip) strength++;
-            if (s->remote_port == tcp->source_port) strength++;
+        if (outbound) {
+            if (s->local_ip != ip->destination_ip) continue;
+        } else if (listening) {
+            if (s->local_ip != ip->destination_ip && s->local_ip != 0) continue;
         }
 
-        if (s->state == SOCKET_LISTENING && strength == 2) {
-            best_match = i;
-            break;
-        }
+        if (s->local_port != tcp->destination_port) continue;
 
-        if (s->state == SOCKET_OUTBOUND && strength == 4) {
-            best_match = i;
-            break;
+        if (outbound) {
+            if (s->remote_ip != ip->source_ip) continue;
+            if (s->remote_port != tcp->source_port) continue;
         }
+        
+        best_match = i;
     }
     if (best_match == -1) {
         // no matching socket, drop.
+        printf("tcp: no matching socket\n");
         return;
     }
-    printf("dispatch found match: %i\n", best_match);
+    printf("tcp dispatch found match: %i\n", best_match);
     struct socket_impl *s = sockets + best_match;
 
     uint32_t tcp_rseq = ntohl(tcp->seq);
     uint32_t tcp_rack = ntohl(tcp->ack);
 
+    if (s->tcp_state == TCP_S_SYN_RECIEVED && tcp->f_ack) {
+        if (tcp_rack == s->send_seq) {
+            s->tcp_state = TCP_S_ESTABLISHED;
+            return;
+        }
+    }
+
     // ACK sequence update
     if (tcp->f_ack) {
         s->send_ack = tcp_rack;
+
+        // TODO: drop retx queue that have been fully ack'd
     }
 
     // RST -> close
     if (s->tcp_state == TCP_S_SYN_SENT && tcp->f_rst) {
         s->tcp_state = TCP_S_CLOSED;
+
         pthread_mutex_lock(&s->block_mtx);
         pthread_cond_signal(&s->block_cond);
         pthread_mutex_unlock(&s->block_mtx);
+    }
+
+    if (s->tcp_state == TCP_S_LISTEN && tcp->f_syn) {
+        pk_incref(pk);
+        list_append(&s->accept_queue, pk, queue);
+
+        pthread_mutex_lock(&s->block_mtx);
+        pthread_cond_signal(&s->block_cond);
+        pthread_mutex_unlock(&s->block_mtx);
+
+        // x_accept creates a new socket and runs the SYN_ACK from there
     }
 
     // SYN/ACK -> Established
     if (s->tcp_state == TCP_S_SYN_SENT && tcp->f_syn && tcp->f_ack) {
         require_that(s->send_ack == s->send_seq);
         s->recv_seq = tcp_rseq + 1; // SYN is ~ 1 byte
-        tcp_ack(s);
+        tcp_status(s, TCP_ACK);
 
         s->tcp_state = TCP_S_ESTABLISHED;
 
@@ -612,7 +600,7 @@ void socket_dispatch_tcp(struct pkb *pk) {
     // FIN -> FIN/ACK
     if (s->tcp_state == TCP_S_ESTABLISHED && tcp->f_fin) {
         s->recv_seq = tcp_rseq + 1; // FIN counts as a byte
-        tcp_fin_ack(s);
+        tcp_status(s, TCP_FIN | TCP_ACK);
 
         s->tcp_state = TCP_S_CLOSE_WAIT;
 
@@ -622,9 +610,12 @@ void socket_dispatch_tcp(struct pkb *pk) {
     }
 
     if (s->tcp_state == TCP_S_CLOSING && tcp->f_ack) {
-        // do I know the ack is _for_ the FIN ?
-        //
-        // also is this CLOSING or LAST_ACK ?
+        s->tcp_state = TCP_S_CLOSED;
+        // is this is the ack _for the FIN_ ?
+
+        pthread_mutex_lock(&s->block_mtx);
+        pthread_cond_signal(&s->block_cond);
+        pthread_mutex_unlock(&s->block_mtx);
     }
 
     uint32_t start_rseq = tcp_rseq;
@@ -649,7 +640,7 @@ void socket_dispatch_tcp(struct pkb *pk) {
                 s->recv_buf_len += tcp_length;
 
                 s->recv_seq = end_rseq;
-                tcp_ack(s);
+                tcp_status(s, TCP_ACK);
 
                 /*
                 if (list_head(&s->ooo_queue)) {
@@ -676,17 +667,6 @@ void socket_dispatch_tcp(struct pkb *pk) {
         printf("TCP RST\n");
         s->tcp_state = TCP_S_CLOSED;
         return;
-    }
-
-    if (s->state == SOCKET_LISTENING) {
-        pk_incref(pk);
-        list_append(&s->accept_queue, pk, queue);
-
-        pthread_mutex_lock(&s->block_mtx);
-        pthread_cond_signal(&s->block_cond);
-        pthread_mutex_unlock(&s->block_mtx);
-
-        // accept runs the syn/ack
     }
 }
 
