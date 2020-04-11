@@ -71,10 +71,19 @@ int i_socket(int domain, int type, int protocol) {
     return i;
 }
 
-int i_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+struct socket_impl *resolve_sockfd(int sockfd) {
     struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) {
+    if (s->valid) {
+        return s;
+    } else {
         errno = ENOTSOCK;
+        return NULL;
+    }
+}
+
+int x_bind(struct socket_impl *s, const struct sockaddr *addr, socklen_t addrlen) {
+    if (addrlen != sizeof(struct sockaddr_in)) {
+        errno = EAFNOSUPPORT;
         return -1;
     }
 
@@ -89,27 +98,14 @@ int i_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
     s->state = SOCKET_BOUND;
     return 0;
-
 }
 
-int i_listen(int sockfd, int backlog) {
-    struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) {
-        errno = ENOTSOCK;
-        return -1;
-    }
-
+int x_listen(struct socket_impl *s, int backlog) {
     s->state = SOCKET_LISTENING;
     return 0;
 }
 
-int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
-    struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) {
-        errno = ENOTSOCK;
-        return -1;
-    }
-
+int x_accept(struct socket_impl *s, struct sockaddr *addr, socklen_t *addrlen) {
     if (!(s->type == SOCK_STREAM)) {
         errno = EOPNOTSUPP;
         return -1;
@@ -183,13 +179,7 @@ int tcp_connect(struct socket_impl *s, const struct sockaddr_in *addr) {
     }
 }
 
-int i_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) {
-        errno = ENOTSOCK;
-        return -1;
-    }
-
+int x_connect(struct socket_impl *s, const struct sockaddr *addr, socklen_t addrlen) {
     const struct sockaddr_in *in_addr = (const struct sockaddr_in *)addr;
     if (in_addr->sin_family != AF_INET) {
         errno = EAFNOSUPPORT;
@@ -218,13 +208,7 @@ void udp_send(struct socket_impl *s, const void *data, size_t len) {
     s->ip_id += 1;
 }
 
-ssize_t i_send(int sockfd, const void *buf, size_t len, int flags) {
-    struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) {
-        errno = ENOTSOCK;
-        return -1;
-    }
-
+ssize_t x_send(struct socket_impl *s, const void *buf, size_t len, int flags) {
     if (s->state != SOCKET_OUTBOUND) {
         errno = EDESTADDRREQ;
         return -1;
@@ -250,14 +234,8 @@ void udp_sendto(struct socket_impl *s, struct sockaddr_in *d_addr,
     s->ip_id += 1;
 }
 
-ssize_t i_sendto(int sockfd, const void *buf, size_t len, int flags,
+ssize_t x_sendto(struct socket_impl *s, const void *buf, size_t len, int flags,
         const struct sockaddr *dest_addr, socklen_t addrlen) {
-    struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) {
-        errno = ENOTSOCK;
-        return -1;
-    }
-
     if (s->type != SOCK_DGRAM) {
         errno = EFAULT; // TODO
         return -1;
@@ -273,14 +251,8 @@ ssize_t i_sendto(int sockfd, const void *buf, size_t len, int flags,
     return len; // what if we sent less?
 }
 
-ssize_t i_recv(int sockfd, void *buf, size_t len, int flags) {
-    printf("I_RECV\n");
-    struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) {
-        errno = ENOTSOCK;
-        return -1;
-    }
-
+ssize_t x_recv(struct socket_impl *s, void *buf, size_t len, int flags) {
+    printf("x_RECV\n");
     size_t buf_ix = 0;
 
     while (buf_ix < len) {
@@ -313,14 +285,8 @@ ssize_t i_recv(int sockfd, void *buf, size_t len, int flags) {
     return buf_ix;
 }
 
-ssize_t i_recvfrom(int sockfd, void *buf, size_t len, int flags,
+ssize_t x_recvfrom(struct socket_impl *s, void *buf, size_t len, int flags,
         struct sockaddr *src_addr, socklen_t *addrlen) {
-    struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) {
-        errno = ENOTSOCK;
-        return -1;
-    }
-
     pthread_mutex_lock(&s->block_mtx);
     struct pkb *recv_pk;
     do {
@@ -350,15 +316,95 @@ ssize_t i_recvfrom(int sockfd, void *buf, size_t len, int flags,
     return len;
 }
 
-int i_close(int sockfd) {
-    struct socket_impl *s = sockets + sockfd;
-    if (!s->valid) return -1;
-    
+int x_close(struct socket_impl *s) {
     // teardown connections ?
 
     s->state = SOCKET_IDLE;
     s->valid = false;
     return 0;
+}
+
+int i_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    struct socket_impl *s = resolve_sockfd(sockfd);
+    if (s) {
+        return x_bind(s, addr, addrlen);
+    } else {
+        return -1;
+    }
+}
+
+int i_listen(int sockfd, int backlog) {
+    struct socket_impl *s = resolve_sockfd(sockfd);
+    if (s) {
+        return x_listen(s, backlog);
+    } else {
+        return -1;
+    }
+}
+
+int i_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    struct socket_impl *s = resolve_sockfd(sockfd);
+    if (s) {
+        return x_accept(s, addr, addrlen);
+    } else {
+        return -1;
+    }
+}
+
+int i_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    struct socket_impl *s = resolve_sockfd(sockfd);
+    if (s) {
+        return x_connect(s, addr, addrlen);
+    } else {
+        return -1;
+    }
+}
+
+ssize_t i_send(int sockfd, const void *buf, size_t len, int flags) {
+    struct socket_impl *s = resolve_sockfd(sockfd);
+    if (s) {
+        return x_send(s, buf, len, flags);
+    } else {
+        return -1;
+    }
+}
+
+ssize_t i_sendto(int sockfd, const void *buf, size_t len, int flags,
+        const struct sockaddr *dest_addr, socklen_t addrlen) {
+    struct socket_impl *s = resolve_sockfd(sockfd);
+    if (s) {
+        return x_sendto(s, buf, len, flags, dest_addr, addrlen);
+    } else {
+        return -1;
+    }
+}
+
+ssize_t i_recv(int sockfd, void *buf, size_t len, int flags) {
+    struct socket_impl *s = resolve_sockfd(sockfd);
+    if (s) {
+        return x_recv(s, buf, len, flags);
+    } else {
+        return -1;
+    }
+}
+
+ssize_t i_recvfrom(int sockfd, void *buf, size_t len, int flags,
+        struct sockaddr *src_addr, socklen_t *addrlen) {
+    struct socket_impl *s = resolve_sockfd(sockfd);
+    if (s) {
+        return x_recvfrom(s, buf, len, flags, src_addr, addrlen);
+    } else {
+        return -1;
+    }
+}
+
+int i_close(int sockfd) {
+    struct socket_impl *s = resolve_sockfd(sockfd);
+    if (s) {
+        return x_close(s);
+    } else {
+        return -1;
+    }
 }
 
 //

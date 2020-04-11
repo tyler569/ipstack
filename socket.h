@@ -4,6 +4,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include "core.h"
 #include "net.h"
 
 typedef uint32_t be32;
@@ -57,9 +58,9 @@ struct socket_impl {
     // TCP {{
     list accept_queue; // accept() TCP_SYN pks
 
-    uint32_t send_seq; // SND.NXT // seq of next byte to send
-    uint32_t send_ack; // SND.UNA // seq of last byte sent acknowleged
-    uint32_t recv_seq; // RCV.NXT // seq of next byte to be recieved
+    uint32_t send_seq; // SND.NXT - seq of next byte to send
+    uint32_t send_ack; // SND.UNA - seq of last byte sent acknowleged
+    uint32_t recv_seq; // RCV.NXT - seq of next byte to be recieved
     uint16_t window_size;
 
     enum tcp_state tcp_state;
@@ -88,6 +89,18 @@ ssize_t i_sendto(int sockfd, const void *buf, size_t len, int flags,
         const struct sockaddr *dest_addr, socklen_t addrlen);
 ssize_t i_recv(int sockfd, void *bud, size_t len, int flags);
 ssize_t i_recvfrom(int sockfd, void *buf, size_t len, int flags,
+        struct sockaddr *src_addr, socklen_t *addrlen);
+
+// int x_socket(int domain, int type, int protocol);
+int x_bind(struct socket_impl *, const struct sockaddr *addr, socklen_t addrlen);
+int x_listen(struct socket_impl *, int backlog);
+int x_accept(struct socket_impl *, struct sockaddr *addr, socklen_t *addrlen);
+int x_connect(struct socket_impl *, const struct sockaddr *addr, socklen_t addrlen);
+ssize_t x_send(struct socket_impl *, const void *buf, size_t len, int flags);
+ssize_t x_sendto(struct socket_impl *, const void *buf, size_t len, int flags,
+        const struct sockaddr *dest_addr, socklen_t addrlen);
+ssize_t x_recv(struct socket_impl *, void *bud, size_t len, int flags);
+ssize_t x_recvfrom(struct socket_impl *, void *buf, size_t len, int flags,
         struct sockaddr *src_addr, socklen_t *addrlen);
 
 void socket_dispatch_udp(struct pkb *);

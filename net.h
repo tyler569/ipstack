@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include "core.h"
 #include "list.h"
 
 #ifdef __GNUC__
@@ -21,8 +22,6 @@ struct socket_impl;
 #define const_htons(x) (((x & 0xFF00) >> 8) | ((x & 0x00FF) << 8))
 #define ETH_MTU 1536
 #define ARRAY_LEN(array) (sizeof(array) / sizeof(*(array)))
-
-struct socket_impl;
 
 typedef uint32_t be32;
 typedef uint16_t be16;
@@ -145,15 +144,6 @@ enum arp_op {
 static const struct mac_address broadcast_mac = {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
 static const struct mac_address zero_mac = {{0, 0, 0, 0, 0, 0}};
 
-struct pkb {
-    uint8_t anno[32];
-    struct net_if *from;
-    long length; // -1 if unknown
-    list_node queue;
-
-    char buffer[];
-};
-
 struct route {
     be32 prefix;
     be32 netmask;
@@ -203,17 +193,13 @@ extern struct route route_table[1];
 
 int tun_alloc(const char *tun_name);
 
-struct pkb *new_pk();
-struct pkb *new_pk_len(size_t len);
-void free_pk(struct pkb *pkb);
-
 struct mac_address mac_from_str_trad(char *mac_str);
 struct mac_address mac_from_str(char *mac_str);
 void print_mac_address(struct mac_address mac);
 bool mac_eq(struct mac_address a, struct mac_address b);
 
 uint32_t ip_from_str(char *ip_str);
-void print_ip_addr(uint32_t ip);
+void print_ip_address(be32 ip);
 void print_arp_pkt(struct pkb *pk);
 
 struct ethernet_header *eth_hdr(struct pkb *pk);

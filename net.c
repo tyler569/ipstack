@@ -22,6 +22,27 @@
 
 const char *if_name = "tap0";
 
+int tun_alloc(const char *tun_name) {
+    int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) {
+        printf("Error: %s\n", strerror(errno));
+        return -1;
+    }
+
+    struct ifreq ifr = {0};
+    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+    strncpy(ifr.ifr_name, tun_name, IFNAMSIZ);
+
+    int err = ioctl(fd, TUNSETIFF, (void *)&ifr);
+    if (err < 0) {
+        printf("Error: %s\n", strerror(errno));
+        close(fd);
+        return err;
+    }
+
+    return fd;
+}
+
 bool mac_eq(struct mac_address a, struct mac_address b) {
     return memcmp(&a, &b, 6) == 0;
 }
@@ -47,11 +68,23 @@ struct pkb *new_pk() {
     struct pkb *new_pk = calloc(1, sizeof(struct pkb) + ETH_MTU);
     new_pk->length = -1;
     new_pk->from = NULL;
+    new_pk->refcount = 1;
     return new_pk;
 }
 
-void free_pk(struct pkb *pkb) {
-    free(pkb);
+void free_pk(struct pkb *pk) {
+    pk_decref(pk);
+    if (pk->refcount <= 0) {
+        free(pk);
+    }
+}
+
+void pk_incref(struct pkb *pk) {
+    pk->refcount++;
+}
+
+void pk_decref(struct pkb *pk) {
+    pk->refcount--;
 }
 
 struct ethernet_header *eth_hdr(struct pkb *pk) {
@@ -300,6 +333,7 @@ void make_tcp(struct socket_impl *s, struct pkb *pk, int flags,
 }
 
 void dispatch(struct pkb *pk) {
+    printf("dispatching %p\n", pk);
     assert(is_ip(pk));
 
     struct ip_header *ip = ip_hdr(pk);
@@ -371,9 +405,12 @@ void arp_cache_put(struct net_if *intf, be32 ip, struct mac_address mac) {
             list_remove(&q->queries);
 
             struct pkb *pending_pk;
-            list_foreach(&q->pending_pks, pending_pk, queue) {
+            while ((pending_pk = list_pop_front(struct pkb, &q->pending_pks, queue))) {
                 dispatch(pending_pk);
+                free(pending_pk);
             }
+
+            free(q);
 
             break;
         }
@@ -397,6 +434,7 @@ void query_for(struct net_if *intf, be32 address, struct pkb *pk) {
     list_foreach(&intf->pending_mac_queries, q, queries) {
         if (address == q->ip) {
             if (pk) {
+                pk_incref(pk);
                 list_append(&q->pending_pks, pk, queue);
             }
             return;
@@ -405,7 +443,7 @@ void query_for(struct net_if *intf, be32 address, struct pkb *pk) {
 
     // The query has not been sent
 
-    q = malloc(sizeof(*q));
+    q = malloc(sizeof(*q)); // freed in arp_cache_put
 
     q->ip = address;
     q->mac = zero_mac;
@@ -413,6 +451,9 @@ void query_for(struct net_if *intf, be32 address, struct pkb *pk) {
 
     list_init(&q->pending_pks);
 
+    printf("appending %p to a queue\n", pk);
+
+    pk_incref(pk);
     list_append(&q->pending_pks, pk, queue);
     list_append(&intf->pending_mac_queries, q, queries);
 
@@ -443,27 +484,6 @@ void arp_query(struct pkb *pk, be32 address, struct net_if *intf) {
                  sizeof(struct arp_header);
 }
 
-
-int tun_alloc(const char *tun_name) {
-    int fd = open("/dev/net/tun", O_RDWR);
-    if (fd < 0) {
-        printf("Error: %s\n", strerror(errno));
-        return -1;
-    }
-
-    struct ifreq ifr = {0};
-    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
-    strncpy(ifr.ifr_name, tun_name, IFNAMSIZ);
-
-    int err = ioctl(fd, TUNSETIFF, (void *)&ifr);
-    if (err < 0) {
-        printf("Error: %s\n", strerror(errno));
-        close(fd);
-        return err;
-    }
-
-    return fd;
-}
 
 struct mac_address mac_from_str_trad(char *mac_str) {
     struct mac_address res = {0};
@@ -531,10 +551,13 @@ uint32_t ip_from_str(char *ip_str) {
     return ip;
 }
 
-void print_ip_addr(uint32_t ip) {
+void print_ip_address(uint32_t ip) {
     printf("%i.%i.%i.%i",
-            (ip >> 24) & 0xff, (ip >> 16) & 0xff,
-            (ip >> 8) & 0xff, ip & 0xff);
+        (ip) & 0xff,
+        (ip >> 8) & 0xff,
+        (ip >> 16) & 0xff,
+        (ip >> 24) & 0xff
+    );
 }
 
 void print_arp_pkt(struct pkb *pk) {
@@ -543,13 +566,13 @@ void print_arp_pkt(struct pkb *pk) {
     int op = ntohs(arp->op);
     if (op == ARP_REQ) {
         printf("arp_hdr Request who-has ");
-        print_ip_addr(ntohl(arp->target_ip));
+        print_ip_address(arp->target_ip);
         printf(" tell ");
-        print_ip_addr(ntohl(arp->sender_ip));
+        print_ip_address(arp->sender_ip);
         printf("\n");
     } else if (op == ARP_RESP) {
         printf("arp_hdr Responce ");
-        print_ip_addr(ntohl(arp->sender_ip));
+        print_ip_address(arp->sender_ip);
         printf(" is-at ");
         print_mac_address(arp->sender_mac);
         printf("\n");
@@ -796,7 +819,6 @@ void process_ethernet(struct pkb *pk) {
 struct net_if interfaces[] = {
     {
         .mac_address = {{0x02, 0x00, 0x00, 0x12, 0x34, 0x56}},
-        // .ip = 0xac1f0102,
         .ip = 0x02011fac,
         .netmask = 0x00ffffff,
         .fd = -1,
