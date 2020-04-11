@@ -863,6 +863,12 @@ int main() {
     void *tcp_out(void *);
     pthread_create(&tcp_out_th, NULL, tcp_out, tport);
 
+    pthread_t tcp_echo_th;
+    int *teport = malloc(sizeof(int));
+    *teport = 1199;
+    void *tcp_echo(void *);
+    pthread_create(&tcp_echo_th, NULL, tcp_echo, teport);
+
     while (true) {
         struct pkb *pk = new_pk();
 

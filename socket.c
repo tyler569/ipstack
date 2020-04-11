@@ -61,6 +61,13 @@ int i_socket(int domain, int type, int protocol) {
     s->protocol = protocol; // IPPROTO_TCP, IPPROTO_UDP, or IP protocol #
     s->state = SOCKET_REQUESTED;
 
+    if (type == SOCK_DGRAM) {
+        list_init(&s->dgram_queue);
+    } else if (type == SOCK_STREAM) {
+        list_init(&s->ooo_queue);
+        list_init(&s->unacked_pks);
+    }
+
     if (protocol == IPPROTO_TCP) {
         s->recv_buf = malloc(TCP_RECV_BUF_LEN);
     }
@@ -101,7 +108,9 @@ int x_bind(struct socket_impl *s, const struct sockaddr *addr, socklen_t addrlen
 }
 
 int x_listen(struct socket_impl *s, int backlog) {
+    list_init(&s->accept_queue);
     s->state = SOCKET_LISTENING;
+    s->tcp_state = TCP_S_LISTEN;
     return 0;
 }
 
@@ -115,7 +124,7 @@ int x_accept(struct socket_impl *s, struct sockaddr *addr, socklen_t *addrlen) {
     struct pkb *accept_pk;
     do {
         pthread_cond_wait(&s->block_cond, &s->block_mtx);
-    } while(!list_head_entry(struct pkb, &s->accept_queue, queue));
+    } while(!list_head(&s->accept_queue));
 
     accept_pk = list_pop_front(struct pkb, &s->accept_queue, queue);
     struct ip_header *accept_ip = ip_hdr(accept_pk);
@@ -131,6 +140,11 @@ int x_accept(struct socket_impl *s, struct sockaddr *addr, socklen_t *addrlen) {
     struct socket_impl *as = sockets + i;
 
     memcpy(as, s, sizeof(struct socket_impl));
+
+    // list_init(&as->accept_queue);
+    list_init(&as->ooo_queue);
+    list_init(&as->unacked_pks);
+
     as->state = SOCKET_OUTBOUND;
     as->tcp_state = TCP_S_SYN_RECIEVED;
     as->remote_ip = accept_ip->source_ip;
@@ -291,7 +305,7 @@ ssize_t x_recvfrom(struct socket_impl *s, void *buf, size_t len, int flags,
     struct pkb *recv_pk;
     do {
         pthread_cond_wait(&s->block_cond, &s->block_mtx);
-    } while (!list_head_entry(struct pkb, &s->dgram_queue, queue));
+    } while (!list_head(&s->dgram_queue));
 
     recv_pk = list_pop_front(struct pkb, &s->dgram_queue, queue);
     struct ip_header *recv_ip = ip_hdr(recv_pk);
@@ -453,6 +467,7 @@ void socket_dispatch_udp(struct pkb *pk) {
     printf("dispatch found match: %i\n", best_match);
     struct socket_impl *s = sockets + best_match;
 
+    pk_incref(pk);
     list_append(&s->dgram_queue, pk, queue);
 
     pthread_mutex_lock(&s->block_mtx);
@@ -637,7 +652,7 @@ void socket_dispatch_tcp(struct pkb *pk) {
                 tcp_ack(s);
 
                 /*
-                if (list_head_entry(&s->ooo_queue)) {
+                if (list_head(&s->ooo_queue)) {
                     // TODO: try to apply ooo data pending
                 }
                 */
@@ -664,6 +679,7 @@ void socket_dispatch_tcp(struct pkb *pk) {
     }
 
     if (s->state == SOCKET_LISTENING) {
+        pk_incref(pk);
         list_append(&s->accept_queue, pk, queue);
 
         pthread_mutex_lock(&s->block_mtx);

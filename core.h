@@ -2,6 +2,7 @@
 #ifndef IPSTACK_CORE_H
 #define IPSTACK_CORE_H
 
+#include <stdint.h>
 #include "list.h"
 
 struct net_if;
