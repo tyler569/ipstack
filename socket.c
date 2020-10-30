@@ -12,7 +12,6 @@
 #include <assert.h>
 #include <errno.h>
 #include "net.h"
-#include "socket.h"
 
 void tcp_send(struct socket_impl *, const void *, size_t);
 void tcp_status(struct socket_impl *, enum tcp_flags);

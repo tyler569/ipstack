@@ -16,9 +16,8 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <pthread.h>
-#include "net.h"
 #include "list.h"
-#include "socket.h"
+#include "net.h"
 
 const char *if_name = "tap0";
 

@@ -9,7 +9,7 @@
 #include <netinet/ip.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include "socket.h"
+#include "net.h"
 
 #define BUFLEN 2048
 

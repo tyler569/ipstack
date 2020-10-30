@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <arpa/inet.h>
-#include "socket.h"
+#include "net.h"
 
 #define BUFLEN 2048
 
